@@ -13,7 +13,7 @@
 
 use ton_types::{Cell, HashmapE, SliceData};
 use ton_vm::{
-    executor::{Engine, gas::gas_state::Gas}, smart_contract_info::SmartContractInfo,
+    executor::{Engine, BehaviorModifiers, gas::gas_state::Gas}, smart_contract_info::SmartContractInfo,
     stack::{Stack, StackItem, savelist::SaveList}
 };
 
@@ -79,6 +79,12 @@ impl VMSetup {
         } else {
             self.vm.set_trace(0);
         }
+        self
+    }
+
+    /// Disables signature check
+    pub fn modify_behavior(mut self, modifiers: BehaviorModifiers) -> VMSetup {
+        self.vm.modify_behavior(modifiers);
         self
     }
 

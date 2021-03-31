@@ -30,7 +30,7 @@ use ton_block::{
 };
 use ton_types::{error, fail, ExceptionCode, Cell, Result, HashmapE, HashmapType, IBitstring, UInt256};
 use ton_vm::{
-    error::tvm_exception, executor::gas::gas_state::Gas,
+    error::tvm_exception, executor::{gas::gas_state::Gas, BehaviorModifiers},
     smart_contract_info::SmartContractInfo,
     stack::{Stack, StackItem},
 };
@@ -48,6 +48,10 @@ const MAX_ACTIONS: usize = 255;
 
 
 pub trait TransactionExecutor {
+    fn behavior_modifiers(&self) -> BehaviorModifiers {
+        BehaviorModifiers::default()
+    }
+
     fn execute_for_account(
         &self,
         in_msg: Option<&Message>,
@@ -262,6 +266,7 @@ pub trait TransactionExecutor {
             .set_libraries(libs)
             .set_gas(gas)
             .set_debug(debug)
+            .modify_behavior(self.behavior_modifiers())
             .create();
         
         //TODO: set vm_init_state_hash

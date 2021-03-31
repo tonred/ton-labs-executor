@@ -29,10 +29,12 @@ use ton_types::{error, fail, Result, HashmapE};
 use ton_vm::{
     int, stack::{Stack, StackItem, integer::IntegerData}
 };
+use ton_vm::executor::BehaviorModifiers;
 
 
 pub struct OrdinaryTransactionExecutor {
     config: BlockchainConfig,
+    disable_signature_check: bool,
 
     #[cfg(feature="timings")]
     timings: [AtomicU64; 3], // 0 - preparation, 1 - compute, 2 - after compute
@@ -42,10 +44,15 @@ impl OrdinaryTransactionExecutor {
     pub fn new(config: BlockchainConfig) -> Self {
         Self {
             config,
+            disable_signature_check: false,
             
             #[cfg(feature="timings")]
             timings: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
         }
+    }
+
+    pub fn set_signature_check_disabled(&mut self, disabled: bool) {
+        self.disable_signature_check = disabled;
     }
 
     #[cfg(feature="timings")]
@@ -55,6 +62,13 @@ impl OrdinaryTransactionExecutor {
 }
 
 impl TransactionExecutor for OrdinaryTransactionExecutor {
+    fn behavior_modifiers(&self) -> BehaviorModifiers {
+        BehaviorModifiers {
+            chksig_always_succeed: self.disable_signature_check,
+            ..Default::default()
+        }
+    }
+
     ///
     /// Create end execute transaction from message for account
     fn execute_for_account(
