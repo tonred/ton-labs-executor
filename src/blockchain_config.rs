@@ -11,6 +11,7 @@
 * limitations under the License.
 */
 
+use std::str::FromStr;
 use ton_block::{
     Grams,
     ConfigParam18, ConfigParams, FundamentalSmcAddresses, 
