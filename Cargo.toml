@@ -29,8 +29,12 @@ ton_types = { git = "https://github.com/broxus/ton-labs-types.git" }
 ton_vm = { git = "https://github.com/broxus/ton-labs-vm.git" }
 
 # External
-failure = "0.1"
-num = "^0.2"
-num-traits = "^0.2.8"
+anyhow = "1.0.42"
+num = "0.3"
+num-traits = "0.2.8"
 log = "0.4.8"
 base64 = "0.13.0"
+thiserror = "1.0.26"
+
+[features]
+asm = ["ton_block/asm", "ton_types/asm", "ton_vm/sha-asm"]
