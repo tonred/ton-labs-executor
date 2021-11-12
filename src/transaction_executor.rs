@@ -10,7 +10,7 @@
 * See the License for the specific TON DEV software governing permissions and
 * limitations under the License.
 */
-
+#![allow(clippy::too_many_arguments)]
 use crate::{
     blockchain_config::{BlockchainConfig, CalcMsgFwdFees},
     error::ExecutorError, vmsetup::VMSetup,
@@ -18,40 +18,78 @@ use crate::{
 
 use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
 use ton_block::{
-    Deserializable, GetRepresentationHash, Serializable,
-    Account, AccountState, ConfigParams, GasLimitsPrices, GlobalCapabilities,
-    AddSub, CurrencyCollection, Grams,
-    Message, MsgAddressInt, MsgAddressIntOrNone,
-    OutAction, OutActions, RESERVE_ALL_BUT, RESERVE_IGNORE_ERROR, RESERVE_VALID_MODES,
-    SENDMSG_ALL_BALANCE, SENDMSG_IGNORE_ERROR, SENDMSG_PAY_FEE_SEPARATELY, SENDMSG_DELETE_IF_EMPTY,
-    SENDMSG_REMAINING_MSG_BALANCE, SENDMSG_VALID_FLAGS,
-    AccStatusChange, ComputeSkipReason, Transaction,
-    TrActionPhase, TrBouncePhase, TrComputePhase, TrComputePhaseVm, TrCreditPhase, TrStoragePhase, HashUpdate,
+    AccStatusChange, Account, AccountStatus, AddSub, AnycastInfo, ComputeSkipReason,
+    CurrencyCollection, Deserializable, GasLimitsPrices, GetRepresentationHash, GlobalCapabilities,
+    Grams, HashUpdate, Message, MsgAddressInt, OutAction,
+    OutActions, Serializable, StorageUsedShort, TrActionPhase, TrBouncePhase, TrComputePhase,
+    TrComputePhaseVm, TrCreditPhase, TrStoragePhase, Transaction, WorkchainFormat,
+    BASE_WORKCHAIN_ID, MASTERCHAIN_ID, RESERVE_ALL_BUT, RESERVE_IGNORE_ERROR, RESERVE_PLUS_ORIG,
+    RESERVE_REVERSE, RESERVE_VALID_MODES, SENDMSG_ALL_BALANCE, SENDMSG_DELETE_IF_EMPTY,
+    SENDMSG_IGNORE_ERROR, SENDMSG_PAY_FEE_SEPARATELY, SENDMSG_REMAINING_MSG_BALANCE,
+    SENDMSG_VALID_FLAGS,
 };
-use ton_types::{error, fail, ExceptionCode, Cell, Result, HashmapE, HashmapType, IBitstring, UInt256};
+use ton_types::{fail, ExceptionCode, Cell, Result, HashmapE, HashmapType, IBitstring, UInt256};
 use ton_vm::{
     error::tvm_exception, executor::{gas::gas_state::Gas, BehaviorModifiers},
     smart_contract_info::SmartContractInfo,
     stack::{Stack, StackItem},
 };
+use ton_block::MsgAddressInt::AddrStd;
+use ton_block::MsgAddressInt::AddrVar;
 
-const RESULT_CODE_ACTIONLIST_INVALID: i32 = 32;
-const RESULT_CODE_TOO_MANY_ACTIONS:   i32 = 33;
-const RESULT_CODE_UNKNOWN_ACTION:     i32 = 34;
-const RESULT_CODE_NOT_ENOUGH_GRAMS:   i32 = 37;
-const RESULT_CODE_NOT_ENOUGH_EXTRA:   i32 = 38;
-const RESULT_CODE_INVALID_BALANCE:    i32 = 40;
-const RESULT_CODE_BAD_ACCOUNT_STATE:  i32 = 41;
-const RESULT_CODE_UNSUPPORTED:        i32 = -1;
+const RESULT_CODE_ACTIONLIST_INVALID:            i32 = 32;
+const RESULT_CODE_TOO_MANY_ACTIONS:              i32 = 33;
+const RESULT_CODE_UNKNOWN_OR_INVALID_ACTION:     i32 = 34;
+const RESULT_CODE_INCORRECT_SRC_ADDRESS:         i32 = 35;
+const RESULT_CODE_INCORRECT_DST_ADDRESS:         i32 = 36;
+const RESULT_CODE_NOT_ENOUGH_GRAMS:              i32 = 37;
+const RESULT_CODE_NOT_ENOUGH_EXTRA:              i32 = 38;
+const RESULT_CODE_INVALID_BALANCE:               i32 = 40;
+const RESULT_CODE_BAD_ACCOUNT_STATE:             i32 = 41;
+const RESULT_CODE_UNSUPPORTED:                   i32 = -1;
+
 const MAX_ACTIONS: usize = 255;
 
+const MAX_MSG_BITS: usize = 1 << 21;
+const MAX_MSG_CELLS: usize = 1 << 13;
 
+
+
+pub struct ExecuteParams {
+    pub state_libs: HashmapE,
+    pub block_unixtime: u32,
+    pub block_lt: u64,
+    pub last_tr_lt: Arc<AtomicU64>,
+    pub seed_block: UInt256,
+    pub debug: bool
+}
+
+impl ExecuteParams {
+    pub fn default() -> Self {
+        Self {
+            state_libs: HashmapE::default(),
+            block_unixtime: 0,
+            block_lt: 0,
+            last_tr_lt: Arc::new(AtomicU64::new(0)),
+            seed_block: UInt256::default(),
+            debug: false
+        }
+    }
+}
 
 pub trait TransactionExecutor {
     fn behavior_modifiers(&self) -> BehaviorModifiers {
         BehaviorModifiers::default()
     }
 
+    fn execute_with_params(
+        &self,
+        in_msg: Option<&Message>,
+        account: &mut Account,
+        params: ExecuteParams,
+    ) -> Result<Transaction>;
+
+    #[deprecated]
     fn execute_for_account(
         &self,
         in_msg: Option<&Message>,
@@ -61,8 +99,45 @@ pub trait TransactionExecutor {
         block_lt: u64,
         last_tr_lt: Arc<AtomicU64>,
         debug: bool
-    ) -> Result<Transaction>;
+    ) -> Result<Transaction> {
+        let params = ExecuteParams {
+            state_libs,
+            block_unixtime,
+            block_lt,
+            last_tr_lt,
+            seed_block: UInt256::default(),
+            debug,
+        };
+        let mut account_root = account.serialize()?;
+        let transaction = self.execute_with_libs_and_params(in_msg, &mut account_root, params)?;
+        *account = Account::construct_from_cell(account_root)?;
+        Ok(transaction)
+    }
+    fn execute_with_libs_and_params(
+        &self,
+        in_msg: Option<&Message>,
+        account_root: &mut Cell,
+        params: ExecuteParams,
+    ) -> Result<Transaction> {
+        let old_hash = account_root.repr_hash();
+        let mut account = Account::construct_from_cell(account_root.clone())?;
+        let mut transaction = self.execute_with_params(
+            in_msg,
+            &mut account,
+            params,
+        )?;
+        if self.config().raw_config().has_capability(GlobalCapabilities::CapFastStorageStat) {
+            account.update_storage_stat_fast()?;
+        } else {
+            account.update_storage_stat()?;
+        }
+        *account_root = account.serialize()?;
+        let new_hash = account_root.repr_hash();
+        transaction.write_state_update(&HashUpdate::with_hashes(old_hash, new_hash))?;
+        Ok(transaction)
+    }
 
+    #[deprecated]
     fn execute_with_libs(
         &self,
         in_msg: Option<&Message>,
@@ -73,23 +148,18 @@ pub trait TransactionExecutor {
         last_tr_lt: Arc<AtomicU64>,
         debug: bool
     ) -> Result<Transaction> {
-        let old_hash = account_root.repr_hash();
-        let mut account = Account::construct_from_cell(account_root.clone())?;
-        let mut transaction = self.execute_for_account(
-            in_msg,
-            &mut account,
+        let params = ExecuteParams {
             state_libs,
             block_unixtime,
             block_lt,
             last_tr_lt,
-            debug
-        )?;
-        *account_root = account.serialize()?;
-        let new_hash = account_root.repr_hash();
-        transaction.write_state_update(&HashUpdate::with_hashes(old_hash, new_hash))?;
-        Ok(transaction)
+            seed_block: UInt256::default(),
+            debug,
+        };
+        self.execute_with_libs_and_params(in_msg, account_root, params)
     }
 
+    #[deprecated]
     fn execute(
         &self,
         in_msg: Option<&Message>,
@@ -99,21 +169,28 @@ pub trait TransactionExecutor {
         last_tr_lt: Arc<AtomicU64>,
         debug: bool
     ) -> Result<Transaction> {
-        self.execute_with_libs(in_msg, account_root, HashmapE::default(), block_unixtime, block_lt, last_tr_lt, debug)
+        let params = ExecuteParams {
+            state_libs: HashmapE::default(),
+            block_unixtime,
+            block_lt,
+            last_tr_lt,
+            seed_block: UInt256::default(),
+            debug,
+        };
+        self.execute_with_libs_and_params(in_msg, account_root, params)
     }
-    fn build_contract_info(&self, config_params: &ConfigParams, acc: &Account, acc_address: &MsgAddressInt, block_unixtime: u32, block_lt: u64, tr_lt: u64) -> SmartContractInfo {
+
+    fn build_contract_info(&self, acc_balance: &CurrencyCollection, acc_address: &MsgAddressInt, block_unixtime: u32, block_lt: u64, tr_lt: u64, seed_block: UInt256) -> SmartContractInfo {
         let mut info = SmartContractInfo::with_myself(acc_address.serialize().unwrap_or_default().into());
         *info.block_lt_mut() = block_lt;
         *info.trans_lt_mut() = tr_lt;
         *info.unix_time_mut() = block_unixtime;
-        if let Some(balance) = acc.get_balance() {
-            // info.set_remaining_balance(balance.grams.0, balance.other.clone());
-            *info.balance_remaining_grams_mut() = balance.grams.0;
-            *info.balance_remaining_other_mut() = balance.other_as_hashmap();
-        }
-        if let Some(data) = config_params.config_params.data() {
+        *info.balance_remaining_grams_mut() = acc_balance.grams.0;
+        *info.balance_remaining_other_mut() = acc_balance.other_as_hashmap();
+        if let Some(data) = self.config().raw_config().config_params.data() {
             info.set_config_params(data.clone());
         }
+        info.calc_rand_seed(seed_block, &acc_address.address().get_bytestring(0));
         info
     }
 
@@ -129,47 +206,64 @@ pub trait TransactionExecutor {
     fn storage_phase(
         &self,
         acc: &mut Account,
+        acc_balance: &mut CurrencyCollection,
         tr: &mut Transaction,
+        is_masterchain: bool,
         is_special: bool
     ) -> Option<TrStoragePhase> {
         log::debug!(target: "executor", "storage_phase");
         if is_special {
             log::debug!(target: "executor", "Special account: AccStatusChange::Unchanged");
-            return Some(TrStoragePhase::with_params(Grams::zero(), None, AccStatusChange::Unchanged))
+            return Some(TrStoragePhase::default())
         }
         if acc.is_none() {
             log::debug!(target: "executor", "Account::None");
-            return Some(TrStoragePhase::with_params(Grams::default(), None, AccStatusChange::Unchanged))
+            return Some(TrStoragePhase::default())
         }
 
         let mut fee = Grams::from(self.config().calc_storage_fee(
             acc.storage_info()?,
-            acc.get_addr()?.is_masterchain(),
+            is_masterchain,
             tr.now(),
         ));
-        if let Some(ref due_payment) = acc.storage_info()?.due_payment {
+        if let Some(due_payment) = acc.due_payment() {
             fee.add(due_payment).ok()?;
+            acc.set_due_payment(None);
         }
 
-        let balance = acc.get_balance()?.grams.clone();
-        if balance >= fee {
-            log::debug!(target: "executor", "storage fee: {}", fee);
+        if acc_balance.grams >= fee {
+            log::debug!(target: "executor", "acc_balance: {}, storage fee: {}", acc_balance.grams, fee);
+            acc_balance.grams.sub(&fee).ok()?;
             tr.add_fee_grams(&fee).ok()?;
-            let fee = CurrencyCollection::from_grams(fee);
-            acc_sub_funds(acc, &fee)?;
-            log::debug!(target: "executor", "AccStatusChange::Unchanged");
-            acc.set_last_paid(tr.now());
-            Some(TrStoragePhase::with_params(fee.grams, None, AccStatusChange::Unchanged))
+            Some(TrStoragePhase::with_params(fee, None, AccStatusChange::Unchanged))
         } else {
-            fee.sub(&balance).ok()?;
-            log::debug!(target: "executor", "storage fee: {}", balance);
-            tr.add_fee_grams(&balance).ok()?;
-            let balance = CurrencyCollection::from_grams(balance);
-            acc_sub_funds(acc, &balance)?;
-            acc.try_freeze().ok()?;
-            log::debug!(target: "executor", "AccStatusChange::Frozen");
-            acc.set_last_paid(tr.now());
-            Some(TrStoragePhase::with_params(balance.grams, Some(fee), AccStatusChange::Frozen))
+            log::debug!(target: "executor", "acc_balance: {} is storage fee from total: {}", acc_balance.grams, fee);
+            let storage_fees_collected = std::mem::replace(&mut acc_balance.grams, Grams::default());
+            tr.add_fee_grams(&storage_fees_collected).ok()?;
+            fee.sub(&storage_fees_collected).ok()?;
+            let need_freeze = fee.0 > self.config().get_gas_config(is_masterchain).freeze_due_limit.into();
+            let need_delete =
+                (acc.status() == AccountStatus::AccStateUninit || acc.status() == AccountStatus::AccStateFrozen) &&
+                fee.0 > self.config().get_gas_config(is_masterchain).delete_due_limit.into();
+
+            if need_delete {
+                let mut total_fees = tr.total_fees.clone();
+                total_fees.add(&CurrencyCollection { grams: Default::default(), other: acc_balance.other.clone() }).ok()?;
+                tr.set_total_fees(total_fees);
+                *acc = Account::new();
+                Some(TrStoragePhase::with_params(storage_fees_collected, Some(fee), AccStatusChange::Deleted))
+            } else if need_freeze {
+                acc.set_due_payment(Some(fee.clone()));
+                if acc.status() == AccountStatus::AccStateActive {
+                    acc.try_freeze().unwrap();
+                    Some(TrStoragePhase::with_params(storage_fees_collected, Some(fee), AccStatusChange::Frozen))
+                } else {
+                    Some(TrStoragePhase::with_params(storage_fees_collected, Some(fee), AccStatusChange::Unchanged))
+                }
+            } else {
+                acc.set_due_payment(Some(fee.clone()));
+                Some(TrStoragePhase::with_params(storage_fees_collected, Some(fee), AccStatusChange::Unchanged))
+            }
         }
     }
 
@@ -177,19 +271,23 @@ pub trait TransactionExecutor {
     /// Increases account balance by the amount that appears in the internal message header.
     /// If account does not exist - phase skipped.
     /// If message is not internal - phase skipped.
-    fn credit_phase(&self, msg: &Message, acc: &mut Account) -> Option<TrCreditPhase> {
-        log::debug!(target: "executor", "credit_phase");
-        let header = msg.int_header()?;
-        if acc.is_none() {
-            log::debug!(target: "executor", "Account in AccountNone");
-            if !header.value.grams.is_zero() {
-                return Some(TrCreditPhase::with_params(None, header.value.clone()))
-            }
-            return None
-        }
-        log::debug!(target: "executor", "add funds {}", header.value.grams);
-        acc.add_funds(&header.value).ok()?;
-        Some(TrCreditPhase::with_params(None, header.value.clone()))
+    fn credit_phase(
+        &self,
+        acc:         &mut Account,
+        tr:          &mut Transaction,
+        msg_balance: &mut CurrencyCollection,
+        acc_balance: &mut CurrencyCollection,
+    ) -> Option<TrCreditPhase> {
+        let due_payment = acc.due_payment().cloned().unwrap_or_else(Grams::default);
+        let collected = std::cmp::min(&due_payment, &msg_balance.grams).clone();
+        msg_balance.grams.0 -= collected.0;
+        let due_payment_remaining = Grams(due_payment.0 - collected.0);
+        acc.set_due_payment(if due_payment_remaining.0 != 0 {Some(due_payment_remaining)} else {None});
+        tr.total_fees.grams.0 += collected.0;
+
+        log::debug!(target: "executor", "credit_phase: add funds {} to {}", msg_balance.grams, acc_balance.grams);
+        acc_balance.add(msg_balance).ok()?;
+        Some(TrCreditPhase::with_params(if collected.0 != 0 {Some(collected)} else {None}, msg_balance.clone()))
         //TODO: Is it need to credit with ihr_fee value in internal messages?
     }
 
@@ -198,59 +296,67 @@ pub trait TransactionExecutor {
     fn compute_phase(
         &self,
         msg: Option<&Message>,
-        acc: &mut Account, 
-        state_libs: HashmapE, // masgerchain libraries
-        smc_info: &SmartContractInfo, 
-        stack_builder: &dyn TransactionExecutor,
+        acc: &mut Account,
+        acc_balance: &mut CurrencyCollection,
+        msg_balance: &CurrencyCollection,
+        state_libs: HashmapE, // masterchain libraries
+        smc_info: SmartContractInfo,
+        stack: Stack,
+        is_masterchain: bool,
         is_special: bool,
         debug: bool,
-    ) -> Result<(TrComputePhase, Option<Cell>)> {
+    ) -> Result<(TrComputePhase, Option<Cell>, Option<Cell>)> {
+        let mut result_acc = acc.clone();
         let mut vm_phase = TrComputePhaseVm::default();
-        let is_masterchain;
-        let (msg_balance, is_external) = if let Some(msg) = msg {
-            is_masterchain = msg.dst().map(|addr| addr.is_masterchain()).unwrap_or_default();
+        let init_code_hash = self.config().raw_config().has_capability(GlobalCapabilities::CapInitCodeHash);
+        let is_external = if let Some(msg) = msg {
             if let Some(header) = msg.int_header() {
-                log::debug!(target: "executor", "msg internal");
-                if acc.is_none() {
-                    if let Some(new_acc) = Account::from_message(msg) {
-                        *acc = new_acc;
-                        acc.set_last_paid(smc_info.unix_time())
+                log::debug!(target: "executor", "msg internal, bounce: {}", header.bounce);
+                if result_acc.is_none() {
+                    if let Some(new_acc) = account_from_message(msg, msg_balance, true, init_code_hash) {
+                        result_acc = new_acc;
+                        result_acc.set_last_paid(smc_info.unix_time());
+
+                        // if there was a balance in message (not bounce), then account state at least become uninit
+                        *acc = result_acc.clone();
+                        acc.uninit_account();
                     }
                 }
-                (header.value.grams.0, false)
+                false
             } else {
                 log::debug!(target: "executor", "msg external");
-                (0, true)
+                true
             }
         } else {
-            debug_assert!(!acc.is_none());
-            is_masterchain = acc.get_addr().map(|addr| addr.is_masterchain()).unwrap_or_default();
-            (0, false)
+            debug_assert!(!result_acc.is_none());
+            false
         };
-        let acc_balance = acc.get_balance().map(|value| value.grams.0).unwrap_or_default();
-        log::debug!(target: "executor", "acc balance: {}", acc_balance);
-        log::debug!(target: "executor", "msg balance: {}", msg_balance);
+        log::debug!(target: "executor", "acc balance: {}", acc_balance.grams);
+        log::debug!(target: "executor", "msg balance: {}", msg_balance.grams);
         let is_ordinary = self.ordinary_transaction();
         let gas_config = self.config().get_gas_config(is_masterchain);
-        let gas = init_gas(acc_balance, msg_balance, is_external, is_special, is_ordinary, gas_config);
+        let gas = init_gas(acc_balance.grams.0, msg_balance.grams.0, is_external, is_special, is_ordinary, gas_config);
         if gas.get_gas_limit() == 0 && gas.get_gas_credit() == 0 {
             log::debug!(target: "executor", "skip computing phase no gas");
-            return Ok((TrComputePhase::skipped(ComputeSkipReason::NoGas), None))
+            return Ok((TrComputePhase::skipped(ComputeSkipReason::NoGas), None, None))
         }
 
         let mut libs = vec![];
-        if let Some(ref msg) = msg {
+        if let Some(msg) = msg {
             if let Some(state_init) = msg.state_init() {
                 libs.push(state_init.libraries().inner());
             }
-            if let Some(reason) = compute_new_state(acc, msg) {
-                return Ok((TrComputePhase::skipped(reason), None))
+            if let Some(reason) = compute_new_state(&mut result_acc, acc_balance, msg, init_code_hash) {
+                if !init_code_hash {
+                    *acc = result_acc;
+                }
+                return Ok((TrComputePhase::skipped(reason), None, None))
             }
         };
         //code must present but can be empty (i.g. for uninitialized account)
-        let code = acc.get_code().unwrap_or_default();
-        let data = acc.get_data().unwrap_or_default();
-        libs.push(acc.libraries().inner());
+        let code = result_acc.get_code().unwrap_or_default();
+        let data = result_acc.get_data().unwrap_or_default();
+        libs.push(result_acc.libraries().inner());
         libs.push(state_libs);
 
         vm_phase.gas_credit = match gas.get_gas_credit() as u32 {
@@ -260,15 +366,15 @@ pub trait TransactionExecutor {
         vm_phase.gas_limit = (gas.get_gas_limit() as u64).into();
 
         let mut vm = VMSetup::new(code.into())
-            .set_contract_info(&smc_info)
-            .set_stack(stack_builder.build_stack(msg, acc))
+            .set_contract_info(smc_info)
+            .set_stack(stack)
             .set_data(data)
             .set_libraries(libs)
             .set_gas(gas)
             .set_debug(debug)
             .modify_behavior(self.behavior_modifiers())
             .create();
-        
+
         //TODO: set vm_init_state_hash
 
         let result = vm.execute();
@@ -297,7 +403,7 @@ pub trait TransactionExecutor {
         // calc gas fees
         let gas = vm.get_gas();
         let credit = gas.get_gas_credit() as u32;
-        //for external messages gas will not be exacted if VM throws the exception and gas_credit != 0 
+        //for external messages gas will not be exacted if VM throws the exception and gas_credit != 0
         let used = gas.get_gas_used() as u64;
         vm_phase.gas_used = used.into();
         if credit != 0 {
@@ -307,29 +413,32 @@ pub trait TransactionExecutor {
             vm_phase.gas_fees = Grams::zero();
         } else { // credit == 0 means contract accepted
             let gas_fees = if is_special { 0 } else { gas_config.calc_gas_fee(used) };
-            vm_phase.gas_fees = Grams(gas_fees.into());
+            vm_phase.gas_fees = gas_fees.into();
         };
 
         log::debug!(
-            target: "executor", 
-            "gas after: gl: {}, gc: {}, gu: {}, fees:{}", 
+            target: "executor",
+            "gas after: gl: {}, gc: {}, gu: {}, fees: {}",
             gas.get_gas_limit() as u64, credit, used, vm_phase.gas_fees
         );
-    
+
         //set mode
         vm_phase.mode = 0;
         vm_phase.vm_steps = vm.steps();
         //TODO: vm_final_state_hash
-        let gas_fees = vm_phase.gas_fees.clone();
-        //exact gass from account balance, balance cannot be less than gas_fees.
-        acc_sub_funds(acc, &CurrencyCollection::from_grams(gas_fees));
-        
-        if let StackItem::Cell(cell) = vm.get_committed_state().get_root() {
-            acc.set_data(cell);
+        log::debug!(target: "executor", "acc_balance: {}, gas fees: {}", acc_balance.grams, vm_phase.gas_fees);
+        if !acc_balance.grams.sub(&vm_phase.gas_fees)? {
+            log::debug!(target: "executor", "can't sub funds: {} from acc_balance: {}", vm_phase.gas_fees, acc_balance.grams);
+            fail!(ExecutorError::TrExecutorError("can't sub funds: from acc_balance".to_string()))
+        }
+
+        let new_data = if let StackItem::Cell(cell) = vm.get_committed_state().get_root() {
+            Some(cell)
         } else {
             log::debug!(target: "executor", "invalid contract, it must be cell in c4 register");
             vm_phase.success = false;
-        }
+            None
+        };
 
         let out_actions = if let StackItem::Cell(root_cell) = vm.get_committed_state().get_actions() {
             Some(root_cell)
@@ -339,38 +448,44 @@ pub trait TransactionExecutor {
             None
         };
 
-        Ok((TrComputePhase::Vm(vm_phase), out_actions))
+        *acc = result_acc;
+        Ok((TrComputePhase::Vm(vm_phase), out_actions, new_data))
     }
 
     /// Implementation of transaction's action phase.
     /// If computing phase is successful then action phase is started.
-    /// If TVM invoked in computing phase returned some output actions, 
+    /// If TVM invoked in computing phase returned some output actions,
     /// then they will be added to transaction's output message list.
     /// Total value from all outbound internal messages will be collected and
-    /// substracted from account balance. If account has enough funds this 
+    /// substracted from account balance. If account has enough funds this
     /// will be succeded, otherwise action phase is failed, transaction will be
     /// marked as aborted, account changes will be rollbacked.
     fn action_phase(
         &self,
         tr: &mut Transaction,
         acc: &mut Account,
+        original_acc_balance: &CurrencyCollection,
+        acc_balance: &mut CurrencyCollection,
         msg_remaining_balance: &mut CurrencyCollection,
+        compute_phase_fees: &Grams,
         actions_cell: Cell,
+        new_data: Option<Cell>,
         is_special: bool,
     ) -> Option<(TrActionPhase, Vec<Message>)> {
+        let mut acc_copy = acc.clone();
+        let mut acc_remaining_balance = acc_balance.clone();
         let mut phase = TrActionPhase::default();
         let mut total_reserved_value = CurrencyCollection::default();
-        let mut out_msgs = vec![];
-        let mut acc_remaining_balance = acc.get_balance()?.clone();
         let mut actions = match OutActions::construct_from_cell(actions_cell) {
             Err(err) => {
                 log::debug!(
-                    target: "executor", 
-                    "cannot parse action list: format is invalid, err: {}", 
+                    target: "executor",
+                    "cannot parse action list: format is invalid, err: {}",
                     err
                 );
-                phase.result_code = RESULT_CODE_ACTIONLIST_INVALID;
-                return Some((phase, out_msgs))
+                // Here you can select only one of 2 error codes: RESULT_CODE_UNKNOWN_OR_INVALID_ACTION or RESULT_CODE_ACTIONLIST_INVALID
+                phase.result_code = RESULT_CODE_UNKNOWN_OR_INVALID_ACTION;
+                return Some((phase, vec![]))
             }
             Ok(actions) => actions
         };
@@ -378,36 +493,103 @@ pub trait TransactionExecutor {
         if actions.len() > MAX_ACTIONS {
             log::debug!(target: "executor", "too many actions: {}", actions.len());
             phase.result_code = RESULT_CODE_TOO_MANY_ACTIONS;
-            return Some((phase, out_msgs))
+            return Some((phase, vec![]))
         }
         phase.action_list_hash = actions.hash().ok()?;
         phase.tot_actions = actions.len() as i16;
 
-        let my_addr = acc.get_addr()?.clone();
+        let process_err_code = |err_code: i32, i: usize, phase: &mut TrActionPhase| {
+            if err_code != 0 {
+                log::debug!(target: "executor", "action failed: error_code={}", err_code);
+                phase.valid = true;
+                phase.result_code = err_code;
+                if i != 0 {
+                    phase.result_arg = Some(i as i32);
+                }
+                if err_code == RESULT_CODE_NOT_ENOUGH_GRAMS || err_code == RESULT_CODE_NOT_ENOUGH_EXTRA {
+                    phase.no_funds = true;
+                }
+                true
+            } else {
+                false
+            }
+        };
+
+        let mut out_msgs0 = vec![];
+        let my_addr = acc_copy.get_addr()?.clone();
+        let workchains = match self.config().raw_config().workchains() {
+            Ok(workchains) => workchains,
+            #[cfg(not(test))]
+            Err(e) => {
+                log::error!(target: "executor", "get workchains error {}", e);
+                return None
+            }
+        };
         for (i, action) in actions.iter_mut().enumerate() {
             let err_code = match std::mem::replace(action, OutAction::None) {
                 OutAction::SendMsg{ mode, mut out_msg } => {
-                    out_msg.set_src(MsgAddressIntOrNone::Some(my_addr.clone()));
+                    if let Some(header) = out_msg.int_header() {
+                        // let src_workchain_id = my_addr.workchain_id();
+                        match header.dst.workchain_id() {
+                            // allow to send only to -1 from 0 or -1
+                            MASTERCHAIN_ID => {
+                                if my_addr.workchain_id() != MASTERCHAIN_ID && my_addr.workchain_id() != BASE_WORKCHAIN_ID {
+                                    log::error!(target: "executor", "masterchain cannot accept from {} workchain", my_addr.workchain_id());
+                                    return None
+                                }
+                            }
+                            // allow to send to self or from master to any which is possible
+                            workchain_id => {
+                                if my_addr.workchain_id() == workchain_id || my_addr.workchain_id() == MASTERCHAIN_ID {
+                                    match workchains.get(&workchain_id) {
+                                        Ok(None) => {
+                                            log::error!(target: "executor", "workchain {} is not deployed", workchain_id);
+                                            return None
+                                        }
+                                        Err(e) => {
+                                            log::error!(target: "executor", "workchain {} cannot be get {}", workchain_id, e);
+                                            return None
+                                        }
+                                        Ok(Some(descr)) => {
+                                            if !descr.accept_msgs {
+                                                log::error!(target: "executor", "cannot send message from {} to {} it doesn't accept", header.src, header.dst);
+                                                return None
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    log::error!(target: "executor", "cannot send message from {} to {} it doesn't allow yet", header.src, header.dst);
+                                    return None
+                                }
+                            }
+                        }
+                    }
+                    if (mode & SENDMSG_ALL_BALANCE) != 0 {
+                        out_msgs0.push((mode, out_msg));
+                        continue
+                    }
                     let result = outmsg_action_handler(
-                        &mut phase, 
+                        &mut phase,
                         mode,
                         &mut out_msg,
                         &mut acc_remaining_balance,
                         msg_remaining_balance,
+                        compute_phase_fees,
                         self.config(),
-                        is_special
+                        is_special,
+                        &my_addr
                     );
                     match result {
                         Ok(_) => {
                             phase.msgs_created += 1;
-                            out_msgs.push(out_msg);
+                            out_msgs0.push((mode, out_msg));
                             0
                         }
                         Err(code) => code
                     }
                 }
                 OutAction::ReserveCurrency{ mode, value } => {
-                    match reserve_action_handler(mode, &value, &mut acc_remaining_balance) {
+                    match reserve_action_handler(mode, &value, original_acc_balance, &mut acc_remaining_balance) {
                         Ok(reserved_value) => {
                             phase.spec_actions += 1;
                             match total_reserved_value.add(&reserved_value) {
@@ -419,7 +601,7 @@ pub trait TransactionExecutor {
                     }
                 }
                 OutAction::SetCode{ new_code: code } => {
-                    match setcode_action_handler(acc, code) {
+                    match setcode_action_handler(&mut acc_copy, code) {
                         None => {
                             phase.spec_actions += 1;
                             0
@@ -428,7 +610,7 @@ pub trait TransactionExecutor {
                     }
                 }
                 OutAction::ChangeLibrary{ mode, code, hash} => {
-                    match change_library_action_handler(acc, mode, code, hash) {
+                    match change_library_action_handler(&mut acc_copy, mode, code, hash) {
                         None => {
                             phase.spec_actions += 1;
                             0
@@ -436,46 +618,61 @@ pub trait TransactionExecutor {
                         Some(code) => code
                     }
                 }
-                OutAction::None => RESULT_CODE_UNKNOWN_ACTION
+                OutAction::None => RESULT_CODE_UNKNOWN_OR_INVALID_ACTION
             };
-            if err_code != 0 {
-                log::debug!(target: "executor", "action failed: error_code={}", err_code);
-                phase.valid = true;
-                phase.result_code = err_code;
-                if i != 0 {
-                    phase.result_arg = Some(i as i32);
+            if process_err_code(err_code, i, &mut phase) {
+                return Some((phase, vec![]))
+            }
+        }
+
+        let mut out_msgs = vec![];
+        for (i, (mode, mut out_msg)) in out_msgs0.into_iter().enumerate() {
+            if (mode & SENDMSG_ALL_BALANCE) == 0 {
+                out_msgs.push(out_msg);
+                continue
+            }
+            let result = outmsg_action_handler(
+                &mut phase,
+                mode,
+                &mut out_msg,
+                &mut acc_remaining_balance,
+                msg_remaining_balance,
+                compute_phase_fees,
+                self.config(),
+                is_special,
+                &my_addr
+            );
+            let err_code = match result {
+                Ok(_) => {
+                    phase.msgs_created += 1;
+                    out_msgs.push(out_msg);
+                    0
                 }
-                if err_code == RESULT_CODE_NOT_ENOUGH_GRAMS || err_code == RESULT_CODE_NOT_ENOUGH_EXTRA {
-                    phase.no_funds = true;
-                }
+                Err(code) => code
+            };
+            if process_err_code(err_code, i, &mut phase) {
                 return Some((phase, vec![]));
             }
         }
 
         //calc new account balance
-        acc_remaining_balance.add(&total_reserved_value).map_err(|err|
-            log::debug!(target: "executor", "failed to add account \
-                balance with reserved value {}", err)).ok()?;
-        //calc difference of new balance from old balance
-        let mut balance_diff = acc.get_balance()?.clone();
-        //must be succeded, because check is already done
-        balance_diff.sub(&acc_remaining_balance).ok()?;
-
-        //TODO: substract difference from account balance
-        if acc_sub_funds(acc, &balance_diff).is_none() {
-            log::debug!(target: "executor", "account balance doesn't have enought grams");
-            phase.no_funds = true;
-            phase.result_code = RESULT_CODE_INVALID_BALANCE;
-        } else {
-            //TODO: some kind of check to freeze account.
+        if let Err(err) = acc_remaining_balance.add(&total_reserved_value) {
+            log::debug!(target: "executor", "failed to add account balance with reserved value {}", err);
+            return None
         }
 
-        if let Some(ref fee) = phase.total_action_fees {
+        if let Some(fee) = phase.total_action_fees.as_ref() {
+            log::debug!(target: "executor", "action fees: {}", fee);
             tr.add_fee_grams(fee).ok()?;
         }
 
         phase.valid = true;
         phase.success = true;
+        *acc_balance = acc_remaining_balance;
+        *acc = acc_copy;
+        if let Some(new_data) = new_data {
+            acc.set_data(new_data);
+        }
         Some((phase, out_msgs))
     }
 
@@ -483,51 +680,57 @@ pub trait TransactionExecutor {
     /// Bounce phase occurs only if transaction 'aborted' flag is set and
     /// if inbound message is internal message with field 'bounce=true'.
     /// Generates outbound internal message for original message sender, with value equal
-    /// to value of original message minus gas payments and forwarding fees 
+    /// to value of original message minus gas payments and forwarding fees
     /// and empty body. Generated message is added to transaction's output message list.
     fn bounce_phase(
         &self,
+        mut remaining_msg_balance: CurrencyCollection,
+        compute_phase_fees: &Grams,
         msg: &Message,
-        acc: &mut Account,
         tr: &mut Transaction,
-        gas_fee: Grams
+        my_addr: &MsgAddressInt,
     ) -> Option<(TrBouncePhase, Option<Message>)> {
         let header = msg.int_header()?;
-        if !header.bounce {
+        if !header.bounce { // TODO convert to panic
             return None
         }
-        let msg_src = match msg.src() {
-            None => {
-                log::warn!(target: "executor", "invalid source address");
-                return None
-            }
-            Some(addr) => addr
-        };
-        let is_masterchain = msg_src.is_masterchain() || header.dst.is_masterchain();
-        let fwd_prices = self.config().get_fwd_prices(is_masterchain);
-
+        // create bounced message and swap src and dst addresses
         let mut header = header.clone();
+        let msg_src = header.src_ref()?.clone();
         let msg_dst = std::mem::replace(&mut header.dst, msg_src);
-        header.src = MsgAddressIntOrNone::Some(msg_dst);
+        header.set_src(msg_dst);
+        if let Some(new_dst) = check_rewrite_dest_addr(my_addr, &header.dst, self.config()) {
+            header.dst = new_dst;
+        } else {
+            log::warn!(target: "executor", "Incorrect destination address in a bounced message {}", header.dst);
+            return None
+        }
 
-        let (storage, fwd_full_fees) = fwd_prices.fwd_fee(&Cell::default());
+        // calculated storage for bounced message is empty
+        let storage = StorageUsedShort::default();
+        let fwd_prices = self.config().get_fwd_prices(msg.is_masterchain());
+        let fwd_full_fees = fwd_prices.fwd_fee(&Cell::default());
         let fwd_mine_fees = fwd_prices.mine_fee(&fwd_full_fees);
         let fwd_fees = Grams::from(fwd_full_fees.0 - fwd_mine_fees.0);
 
-        if !header.value.grams.sub(&gas_fee).ok()? {
+        if remaining_msg_balance.grams.0 < fwd_full_fees.0 + compute_phase_fees.0 {
+            log::debug!(
+                target: "executor", "bounce phase - not enough grams {} to get fwd fee {}",
+                remaining_msg_balance, fwd_full_fees
+            );
             return Some((TrBouncePhase::no_funds(storage, fwd_full_fees), None))
         }
-        if header.value.grams.0 < fwd_full_fees.0 {
-            return Some((TrBouncePhase::no_funds(storage, fwd_full_fees), None))
-        }
-        log::debug!(target: "executor", "get fee {} from bounce msg {}", fwd_full_fees, header.value.grams);
-        acc_sub_funds(acc, &header.value)?;
-        header.value.grams.sub(&fwd_full_fees).ok()?;
+
+        // create header for new bounced message and swap src and dst addresses
+        log::debug!(target: "executor", "get fee {} from bounce msg {}", fwd_full_fees, remaining_msg_balance);
+        remaining_msg_balance.grams.sub(&fwd_full_fees).ok()?;
+        remaining_msg_balance.grams.sub(compute_phase_fees).ok()?;
         header.ihr_disabled = true;
         header.bounce = false;
         header.bounced = true;
         header.ihr_fee = Grams::zero();
         header.fwd_fee = fwd_fees.clone();
+        header.value = remaining_msg_balance.clone();
 
         let mut bounce_msg = Message::with_int_header(header);
         if self.config().has_capability(GlobalCapabilities::CapBounceMsgBody) {
@@ -536,15 +739,16 @@ pub trait TransactionExecutor {
                 body.shrink_data(0..256);
                 builder.append_bytestring(&body).ok()?;
             }
-            bounce_msg.set_body(builder.into());
+            bounce_msg.set_body(builder.into_cell().ok()?.into());
         }
+
+        log::debug!(target: "executor", "bounce fees: {} bounce value: {}", fwd_mine_fees, bounce_msg.get_value().unwrap().grams);
         tr.add_fee_grams(&fwd_mine_fees).ok()?;
         Some((TrBouncePhase::ok(storage, fwd_mine_fees, fwd_fees), Some(bounce_msg)))
     }
 
     fn add_messages(&self, tr: &mut Transaction, out_msgs: Vec<Message>, lt: Arc<AtomicU64>) -> Result<u64> {
         let mut lt = lt.fetch_add(1 + out_msgs.len() as u64, Ordering::Relaxed);
-        tr.set_logical_time(lt);
         lt += 1;
         for mut msg in out_msgs {
             msg.set_at_and_lt(tr.now(), lt);
@@ -560,26 +764,26 @@ pub trait TransactionExecutor {
 /// If account is uninitialized - it can be created with active state.
 /// If account exists - it can be frozen.
 /// Returns computed initial phase.
-fn compute_new_state(acc: &mut Account, in_msg: &Message) -> Option<ComputeSkipReason> {
+fn compute_new_state(acc: &mut Account, acc_balance: &CurrencyCollection, in_msg: &Message, init_code_hash: bool) -> Option<ComputeSkipReason> {
     log::debug!(target: "executor", "compute_account_state");
-    match acc.state() {
-        None => {
+    match acc.status() {
+        AccountStatus::AccStateNonexist => {
             log::error!(target: "executor", "account must exist");
             Some(ComputeSkipReason::BadState)
         }
         //Account exists, but can be in different states.
-        Some(AccountState::AccountActive(_)) => {
+        AccountStatus::AccStateActive => {
             //account is active, just return it
             log::debug!(target: "executor", "account state: AccountActive");
             None
         }
-        Some(AccountState::AccountUninit) => {
+        AccountStatus::AccStateUninit => {
             log::debug!(target: "executor", "AccountUninit");
             if let Some(state_init) = in_msg.state_init() {
                 // if msg is a constructor message then
                 // borrow code and data from it and switch account state to 'active'.
-                log::debug!(target: "executor", "external message for uninitialized: activated");
-                match acc.try_activate(&state_init) {
+                log::debug!(target: "executor", "message for uninitialized: activated");
+                match acc.try_activate_by_init_code_hash(state_init, init_code_hash) {
                     Err(err) => {
                         log::debug!(target: "executor", "reason: {}", err);
                         Some(ComputeSkipReason::NoState)
@@ -591,14 +795,14 @@ fn compute_new_state(acc: &mut Account, in_msg: &Message) -> Option<ComputeSkipR
                 Some(ComputeSkipReason::NoState)
             }
         }
-        Some(AccountState::AccountFrozen(_)) => {
+        AccountStatus::AccStateFrozen => {
             log::debug!(target: "executor", "AccountFrozen");
             //account balance was credited and if it positive after that
             //and inbound message bear code and data then make some check and unfreeze account
-            if !acc.get_balance().map(|balance| balance.grams.is_zero()).unwrap_or_default() {
+            if !acc_balance.grams.is_zero() {
                 if let Some(state_init) = in_msg.state_init() {
-                    log::debug!(target: "executor", "external message for frozen: activated");
-                    return match acc.try_activate(&state_init) {
+                    log::debug!(target: "executor", "message for frozen: activated");
+                    return match acc.try_activate_by_init_code_hash(state_init, init_code_hash) {
                         Err(err) => {
                             log::debug!(target: "executor", "reason: {}", err);
                             Some(ComputeSkipReason::NoState)
@@ -614,19 +818,123 @@ fn compute_new_state(acc: &mut Account, in_msg: &Message) -> Option<ComputeSkipR
     }
 }
 
+fn check_replace_src_addr<'a>(src: &'a Option<MsgAddressInt>, acc_addr: &'a MsgAddressInt) -> Option<&'a MsgAddressInt> {
+    match src {
+        None => Some(acc_addr),
+        Some(src) => match src {
+            AddrStd(_) => {
+                if src != acc_addr {
+                    None
+                } else {
+                    Some(src)
+                }
+            }
+            AddrVar(_) => None
+        }
+    }
+}
+
+fn is_valid_addr_len(addr_len: u16, min_addr_len: u16, max_addr_len: u16, addr_len_step: u16) -> bool {
+    (addr_len >= min_addr_len) && (addr_len <= max_addr_len) &&
+    ((addr_len == min_addr_len) || (addr_len == max_addr_len) ||
+    ((addr_len_step != 0) && ((addr_len - min_addr_len) % addr_len_step == 0)))
+}
+
+fn check_rewrite_dest_addr(src: &MsgAddressInt, dst: &MsgAddressInt, config: &BlockchainConfig) -> Option<MsgAddressInt> {
+    let (mut anycast_opt, addr_len, workchain_id, address, mut repack);
+    match dst {
+        MsgAddressInt::AddrVar(dst) => {
+            repack = dst.addr_len.0 == 256 && dst.workchain_id >= -128 && dst.workchain_id < 128;
+            anycast_opt = dst.anycast.clone();
+            addr_len = dst.addr_len.0 as u16;
+            workchain_id = dst.workchain_id;
+            address = dst.address.clone();
+        }
+        MsgAddressInt::AddrStd(dst) => {
+            repack = false;
+            anycast_opt = dst.anycast.clone();
+            addr_len = 256;
+            workchain_id = dst.workchain_id as i32;
+            address = dst.address.clone();
+        }
+    }
+
+    let is_masterchain = workchain_id == MASTERCHAIN_ID;
+    if !is_masterchain {
+        let workchains = config.raw_config().workchains().unwrap_or_default();
+        if let Ok(Some(wc)) = workchains.get(&workchain_id) {
+            if !wc.accept_msgs {
+                log::debug!(target: "executor", "destination address belongs to workchain {} not accepting new messages", workchain_id);
+                return None;
+            }
+            let (min_addr_len, max_addr_len, addr_len_step) = match wc.format {
+                WorkchainFormat::Extended(wf) => (wf.min_addr_len(), wf.max_addr_len(), wf.addr_len_step()),
+                WorkchainFormat::Basic(_) => (256, 256, 0)
+            };
+            if !is_valid_addr_len(addr_len, min_addr_len, max_addr_len, addr_len_step) {
+                log::debug!(target: "executor", "destination address has length {} invalid for destination workchain {}", addr_len, workchain_id);
+                return None
+            }
+        } else {
+            log::debug!(target: "executor", "destination address contains unknown workchain_id {}", workchain_id);
+            return None
+        }
+    }
+
+    if let Some(anycast) = &anycast_opt {
+        if is_masterchain {
+            log::debug!(target: "executor", "masterchain address cannot be anycast");
+            return None
+        }
+        match src.address().get_slice(0, anycast.depth.0 as usize) {
+            Ok(pfx) => {
+                if pfx != anycast.rewrite_pfx {
+                    match AnycastInfo::with_rewrite_pfx(pfx) {
+                        Ok(anycast) => {
+                            repack = true;
+                            anycast_opt = Some(anycast)
+                        }
+                        Err(err) => {
+                            log::debug!(target: "executor", "Incorrect anycast prefix {}", err);
+                            return None
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                log::debug!(target: "executor", "Incorrect src address {}", err);
+                return None
+            }
+        }
+    }
+
+    if !repack {
+        Some(dst.clone())
+    } else if addr_len == 256 && workchain_id >= -128 && workchain_id < 128 {
+        // repack as an addr_std
+        MsgAddressInt::with_standart(anycast_opt, workchain_id as i8, address).ok()
+    } else {
+        // repack as an addr_var
+        MsgAddressInt::with_variant(anycast_opt, workchain_id, address).ok()
+    }
+}
+
 fn outmsg_action_handler(
-    phase: &mut TrActionPhase, 
-    mut mode: u8, 
+    phase: &mut TrActionPhase,
+    mut mode: u8,
     msg: &mut Message,
     acc_balance: &mut CurrencyCollection,
     msg_balance: &mut CurrencyCollection,
+    compute_phase_fees: &Grams,
     config: &BlockchainConfig,
     is_special: bool,
+    my_addr: &MsgAddressInt,
 ) -> std::result::Result<CurrencyCollection, i32> {
     // we cannot send all balance from account and from message simultaneously ?
     let invalid_flags = SENDMSG_REMAINING_MSG_BALANCE | SENDMSG_ALL_BALANCE;
     if  (mode & !SENDMSG_VALID_FLAGS) != 0 ||
-        (mode & invalid_flags) == invalid_flags
+        (mode & invalid_flags) == invalid_flags ||
+        ((mode & SENDMSG_DELETE_IF_EMPTY) != 0 && (mode & SENDMSG_ALL_BALANCE) == 0)
     {
         log::error!(target: "executor", "outmsg mode has unsupported flags");
         return Err(RESULT_CODE_UNSUPPORTED);
@@ -639,15 +947,19 @@ fn outmsg_action_handler(
     let (fwd_mine_fee, total_fwd_fees);
     let mut result_value; // to sub from acc_balance
 
-    // TODO: check and rewrite src and dst adresses (see check_replace_src_addr and 
-    // check_rewrite_dest_addr functions)
+    if let Some(new_src) = check_replace_src_addr(&msg.src(), my_addr) {
+        msg.set_src_address(new_src.clone());
+    } else {
+        log::warn!(target: "executor", "Incorrect source address {:?}", msg.src());
+        return Err(RESULT_CODE_INCORRECT_SRC_ADDRESS);
+    }
 
     let fwd_prices = config.get_fwd_prices(msg.is_masterchain());
     let compute_fwd_fee = if is_special {
         Grams::default()
     } else {
         msg.serialize()
-        .map(|cell| fwd_prices.fwd_fee(&cell).1)
+        .map(|cell| fwd_prices.fwd_fee(&cell))
         .map_err(|err| {
             log::error!(target: "executor", "cannot serialize message in action phase : {}", err);
             RESULT_CODE_ACTIONLIST_INVALID
@@ -655,7 +967,16 @@ fn outmsg_action_handler(
     };
 
     if let Some(int_header) = msg.int_header_mut() {
+        if let Some(new_dst) = check_rewrite_dest_addr(my_addr, &int_header.dst, config) {
+            int_header.dst = new_dst;
+        } else {
+            log::warn!(target: "executor", "Incorrect destination address {}", int_header.dst);
+            return Err(skip.map(|_| RESULT_CODE_INCORRECT_DST_ADDRESS).unwrap_or(0))
+        }
+
+        int_header.bounced = false;
         result_value = int_header.value.clone();
+        int_header.ihr_disabled = true; // ihr is disabled because it does not work
         if int_header.ihr_disabled {
             int_header.ihr_fee = Grams::default();
         } else {
@@ -679,17 +1000,26 @@ fn outmsg_action_handler(
         if (mode & SENDMSG_REMAINING_MSG_BALANCE) != 0 {
             //send all remainig balance of inbound message
             result_value.add(msg_balance).ok();
-            int_header.value.add(msg_balance).ok();
+            if (mode & SENDMSG_PAY_FEE_SEPARATELY) == 0 {
+                if result_value.grams.0 < compute_phase_fees.0 {
+                    return Err(skip.map(|_| RESULT_CODE_NOT_ENOUGH_GRAMS).unwrap_or(0))
+                }
+                result_value.grams.sub(compute_phase_fees).map_err(|err| {
+                    log::error!(target: "executor", "cannot subtract msg balance : {}", err);
+                    RESULT_CODE_ACTIONLIST_INVALID
+                })?;
+            }
+            int_header.value = result_value.clone();
             *msg_balance = CurrencyCollection::default();
         }
         if (mode & SENDMSG_PAY_FEE_SEPARATELY) != 0 {
             //we must pay the fees, sum them with msg value
             result_value.grams.0 += total_fwd_fees.0;
         } else if int_header.value.grams.0 < total_fwd_fees.0 {
-            //msg value is too small, reciever cannot pay the fees 
+            //msg value is too small, reciever cannot pay the fees
             log::warn!(
-                target: "executor", 
-                "msg balance {} is too small, cannot pay fwd+ihr fees: {}", 
+                target: "executor",
+                "msg balance {} is too small, cannot pay fwd+ihr fees: {}",
                 int_header.value.grams, total_fwd_fees
             );
             return Err(skip.map(|_| RESULT_CODE_NOT_ENOUGH_GRAMS).unwrap_or(0))
@@ -708,29 +1038,30 @@ fn outmsg_action_handler(
         return Err(-1)
     }
 
+    log::debug!(target: "executor", "sub funds {} from {}", result_value, acc_balance.grams);
     if acc_balance.grams.0 < result_value.grams.0 {
         log::warn!(
-            target: "executor", 
+            target: "executor",
             "account balance {} is too small, cannot send {}", acc_balance.grams, result_value.grams
-        ); 
+        );
         return Err(skip.map(|_| RESULT_CODE_NOT_ENOUGH_GRAMS).unwrap_or(0))
     }
     match acc_balance.sub(&result_value) {
         Ok(false) | Err(_) => {
             log::warn!(
-                target: "executor", 
+                target: "executor",
                 "account balance {} is too small, cannot send {}", acc_balance, result_value
-            ); 
+            );
             return Err(skip.map(|_| RESULT_CODE_NOT_ENOUGH_EXTRA).unwrap_or(0))
         }
         _ => ()
     }
 
     // TODO: check if was reserved something
-    if (mode & SENDMSG_DELETE_IF_EMPTY) != 0 {
-        if acc_balance.grams.0 == 0 {
-            phase.status_change = AccStatusChange::Deleted;
-        }
+    if (mode & SENDMSG_DELETE_IF_EMPTY) != 0
+    && (mode & SENDMSG_ALL_BALANCE) != 0
+    && acc_balance.grams.0 == 0 {
+        phase.status_change = AccStatusChange::Deleted;
     }
 
     // total fwd fees is sum of messages full fwd and ihr fees
@@ -749,43 +1080,68 @@ fn outmsg_action_handler(
     })?;
     phase.tot_msg_size.append(&msg_cell);
 
-    log::info!(target: "executor", "msg exports value {}", result_value.grams.0);
+    if phase.tot_msg_size.bits() as usize > MAX_MSG_BITS || phase.tot_msg_size.cells() as usize > MAX_MSG_CELLS {
+        log::warn!(target: "executor", "message too large : bits: {}, cells: {}", phase.tot_msg_size.bits(), phase.tot_msg_size.cells());
+        return Err(RESULT_CODE_INVALID_BALANCE);
+    }
+
+    log::info!(target: "executor", "msg with flags: {} exports value {}", mode, result_value.grams.0);
     Ok(result_value)
 }
 
-/// Reserves some grams from accout balance. 
+/// Reserves some grams from accout balance.
 /// Returns calculated reserved value. its calculation depends on mode.
 /// Reduces balance by the amount of the reserved value.
 fn reserve_action_handler(
-    mode: u8, 
+    mode: u8,
     val: &CurrencyCollection,
+    original_acc_balance: &CurrencyCollection,
     acc_remaining_balance: &mut CurrencyCollection,
 ) -> std::result::Result<CurrencyCollection, i32> {
-    if (mode & !RESERVE_VALID_MODES) != 0 {
-        return Err(RESULT_CODE_UNSUPPORTED);
+    if mode & !RESERVE_VALID_MODES != 0 {
+        return Err(RESULT_CODE_ACTIONLIST_INVALID);
     }
 
-    let mut reserved = val.clone();
-    //TODO: need to compare extra currencies too.
-    if reserved.grams.0 > acc_remaining_balance.grams.0 {
-        //reserving more than remaining balance has,
-        //this is error, but check the flag
-        if (mode & RESERVE_IGNORE_ERROR) != 0 {
-            //reserve all remaining balance
-            reserved = acc_remaining_balance.clone();
+    let mut reserved;
+    if mode & RESERVE_PLUS_ORIG != 0 {
+        // Append all currencies
+        if mode & RESERVE_REVERSE != 0 {
+            reserved = original_acc_balance.clone();
+            let result = reserved.sub(val);
+            match result {
+                Err(_) => return Err(RESULT_CODE_INVALID_BALANCE),
+                Ok(false) => return Err(RESULT_CODE_NOT_ENOUGH_GRAMS),
+                Ok(true) => ()
+            }
         } else {
-            return Err(RESULT_CODE_NOT_ENOUGH_GRAMS);
+            reserved = val.clone();
+            reserved.add(original_acc_balance).or(Err(RESULT_CODE_INVALID_BALANCE))?;
         }
     } else {
-        // check the mode
-        if (mode & RESERVE_ALL_BUT) != 0 {
-            // need to reserve all but 'val' grams
-            reserved = acc_remaining_balance.clone();
-            reserved.sub(&val).or(Err(RESULT_CODE_INVALID_BALANCE))?;
-        } 
+        if mode & RESERVE_REVERSE != 0 { // flag 8 without flag 4 unacceptable
+            return Err(RESULT_CODE_ACTIONLIST_INVALID);
+        }
+        reserved = val.clone();
+    }
+    if mode & RESERVE_IGNORE_ERROR != 0 {
+        // Only grams
+        reserved.grams.0 = std::cmp::min(reserved.grams.0, acc_remaining_balance.grams.0);
     }
 
-    acc_remaining_balance.sub(&reserved).or(Err(RESULT_CODE_INVALID_BALANCE))?;
+    let mut remaining = acc_remaining_balance.clone();
+    let result = remaining.sub(&reserved);
+    match result {
+        Err(_) => return Err(RESULT_CODE_INVALID_BALANCE),
+        Ok(false) => return Err(RESULT_CODE_NOT_ENOUGH_GRAMS),
+        Ok(true) => ()
+    }
+    std::mem::swap(&mut remaining, acc_remaining_balance);
+
+    if mode & RESERVE_ALL_BUT != 0 {
+        // swap all currencies
+        std::mem::swap(&mut reserved, acc_remaining_balance);
+    }
+
     Ok(reserved)
 }
 
@@ -801,14 +1157,14 @@ fn change_library_action_handler(acc: &mut Account, mode: u8, code: Option<Cell>
     let result = match (code, hash) {
         (Some(code), None) => {
             log::debug!(target: "executor", "OutAction::ChangeLibrary mode: {}, code: {}", mode, code);
-            if mode == 0 {
+            if mode == 0 { // TODO: Wrong codes. Look ton_block/out_actions::SET_LIB_CODE_REMOVE
                 acc.delete_library(&code.repr_hash())
             } else {
                 acc.set_library(code, (mode & 2) == 2)
             }
         }
         (None, Some(hash)) => {
-            log::debug!(target: "executor", "OutAction::ChangeLibrary mode: {}, hash: {}", mode, hash.to_hex_string());
+            log::debug!(target: "executor", "OutAction::ChangeLibrary mode: {}, hash: {:x}", mode, hash);
             if mode == 0 {
                 acc.delete_library(&hash)
             } else {
@@ -839,17 +1195,40 @@ fn init_gas(acc_balance: u128, msg_balance: u128, is_external: bool, is_special:
         std::cmp::min(gas_max, gas_info.calc_gas(msg_balance))
     };
     log::debug!(
-        target: "executor", 
-        "gas before: gm: {}, gl: {}, gc: {}, price: {}", 
+        target: "executor",
+        "gas before: gm: {}, gl: {}, gc: {}, price: {}",
         gas_max, gas_limit, gas_credit, gas_info.get_real_gas_price()
     );
     Gas::new(gas_limit as i64, gas_credit as i64, gas_max as i64, gas_info.get_real_gas_price() as i64)
 }
 
-fn acc_sub_funds(acc: &mut Account, funds_to_sub: &CurrencyCollection) -> Option<()> {
-    let acc_balance = acc.get_balance().map(|value| value.grams.0).unwrap_or_default();
-    log::debug!(target: "executor", "acc_balance: {}, sub funds: {}", acc_balance, funds_to_sub.grams);
-    acc.sub_funds(funds_to_sub).map_err(|err|
-        log::error!(target: "executor", "cannot sub funds {:?} from account balance {:?} : {}",
-            funds_to_sub, acc_balance, err)).ok().map(|_|())
+/// Calculate new account according to inbound message.
+/// If message has no value, account will not created.
+/// If hash of state_init is equal to account address (or flag check address is false), account will be active.
+/// Otherwise, account will be nonexist or uninit according bounce flag: if bounce, account will be uninit that save money.
+fn account_from_message(msg: &Message, msg_remaining_balance: &CurrencyCollection, check_address: bool, init_code_hash: bool) -> Option<Account> {
+    let hdr = msg.int_header()?;
+    if msg_remaining_balance.grams.is_zero() {
+        log::trace!(target: "executor", "The message has no money");
+        return None
+    }
+    if let Some(init) = msg.state_init() {
+        if init.code().is_some() {
+            if !check_address || (init.hash().ok()? == hdr.dst.address()) {
+                return Account::active_by_init_code_hash(hdr.dst.clone(), msg_remaining_balance.clone(), 0, init.clone(), init_code_hash).ok();
+            } else if check_address {
+                log::trace!(
+                    target: "executor",
+                    "Cannot construct account from message with hash {:x} because the destination address does not math with hash message code",
+                    msg.hash().unwrap()
+                );
+            }
+        }
+    }
+    if hdr.bounce {
+        log::trace!(target: "executor", "Account will not be created. Value of {:x} message will be returned", msg.hash().unwrap());
+        None
+    } else {
+        Some(Account::uninit(hdr.dst.clone(), 0, 0, msg_remaining_balance.clone()))
+    }
 }

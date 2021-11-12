@@ -20,7 +20,7 @@ use ton_block::{
 };
 use ton_types::{UInt256, Cell, Result};
 
-pub trait TONDefaultConfig {
+pub(crate) trait TONDefaultConfig {
     /// Get default value for masterchain
     fn default_mc() -> Self;
     /// Get default value for workchains
@@ -52,7 +52,7 @@ impl TONDefaultConfig for MsgForwardPrices {
 }
 
 pub trait CalcMsgFwdFees {
-    fn fwd_fee(&self, msg_cell: &Cell) -> (StorageUsedShort, Grams);
+    fn fwd_fee(&self, msg_cell: &Cell) -> Grams;
     fn ihr_fee (&self, fwd_fee: &Grams) -> Grams;
     fn mine_fee(&self, fwd_fee: &Grams) -> Grams;
     fn next_fee(&self, fwd_fee: &Grams) -> Grams;
@@ -63,13 +63,13 @@ impl CalcMsgFwdFees for MsgForwardPrices {
     /// Forward fee is calculated according to the following formula:
     /// `fwd_fee = (lump_price + ceil((bit_price * msg.bits + cell_price * msg.cells)/2^16))`.
     /// `msg.bits` and `msg.cells` are calculated from message represented as tree of cells. Root cell is not counted.
-    fn fwd_fee(&self, msg_cell: &Cell) -> (StorageUsedShort, Grams) {
+    fn fwd_fee(&self, msg_cell: &Cell) -> Grams {
         let mut storage = StorageUsedShort::default();
         storage.append(msg_cell);
-        storage.cells.0 -= 1;
-        storage.bits.0 -= msg_cell.bit_length() as u64;
-        let cells = u128::from(storage.cells.0);
-        let bits = u128::from(storage.bits.0);
+        let mut bits = storage.bits() as u128;
+        let mut cells = storage.cells() as u128;
+        bits -= msg_cell.bit_length() as u128;
+        cells -= 1;
 
         // All prices except `lump_price` are presented in `0xffff * price` form.
         // It is needed because `ihr_factor`, `first_frac` and `next_frac` are not integer values
@@ -77,7 +77,7 @@ impl CalcMsgFwdFees for MsgForwardPrices {
         // number (0xffff) and fee calculation uses such values. At the end result is divided by
         // 0xffff with ceil rounding to obtain nanograms (add 0xffff and then `>> 16`)
         let fwd_fee = self.lump_price as u128 + ((cells * self.cell_price as u128 + bits * self.bit_price as u128 + 0xffff) >> 16);
-        (storage, fwd_fee.into())
+        fwd_fee.into()
     }
 
     /// Calculate message IHR fee
@@ -124,7 +124,7 @@ impl Default for AccStoragePrices {
 impl AccStoragePrices {
     /// Calculate storage fee for provided data
     pub fn calc_storage_fee(&self, cells: u128, bits: u128, mut last_paid: u32, now: u32, is_masterchain: bool) -> u128 {
-        if now <= last_paid || last_paid == 0 || self.prices.len() == 0 || now <= self.prices[0].utime_since {
+        if now <= last_paid || last_paid == 0 || self.prices.is_empty() || now <= self.prices[0].utime_since {
             return 0
         }
         let mut fee = 0u128;
@@ -242,9 +242,10 @@ impl BlockchainConfig {
     }
 
     fn get_defult_raw_config() -> ConfigParams {
-        let mut config = ConfigParams::default();
-        config.config_addr = [0x55; 32].into();
-        config
+        ConfigParams {
+            config_addr: [0x55; 32].into(),
+            ..ConfigParams::default()
+        }
     }
 
     /// Create `BlockchainConfig` struct with `ConfigParams` taken from blockchain
@@ -292,9 +293,9 @@ impl BlockchainConfig {
     /// Calculate account storage fee
     pub fn calc_storage_fee(&self, storage: &StorageInfo, is_masterchain: bool, now: u32) -> u128 {        
         self.storage_prices.calc_storage_fee(
-            storage.used.cells.0.into(),
-            storage.used.bits.0.into(),
-            storage.last_paid,
+            storage.used().cells().into(),
+            storage.used().bits().into(),
+            storage.last_paid(),
             now,
             is_masterchain
         )
@@ -308,7 +309,7 @@ impl BlockchainConfig {
             // config account is special too
             Ok(
                 self.raw_config.config_addr == account_id ||
-                self.special_contracts.check_key(&account_id)?
+                self.special_contracts.get_raw(account_id)?.is_some()
             )
 
         } else {
