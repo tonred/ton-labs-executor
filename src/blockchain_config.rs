@@ -235,10 +235,22 @@ impl BlockchainConfig {
     }
 
     fn get_defult_raw_config() -> ConfigParams {
-        ConfigParams {
+        let mut params = ConfigParams {
             config_addr: [0x55; 32].into(),
             ..ConfigParams::default()
-        }
+        };
+
+        let mut workchains = ton_block::ConfigParam12::default();
+
+        let mut workchain_0 = ton_block::WorkchainDescr::default();
+        workchain_0.active = true;
+        workchain_0.accept_msgs = true;
+        workchains.insert(0, &workchain_0).expect("Shouldn't fail");
+
+        params.set_config(ton_block::ConfigParamEnum::ConfigParam12(workchains))
+            .expect("Shouldn't fail");
+
+        params
     }
 
     /// Create `BlockchainConfig` struct with `ConfigParams` taken from blockchain
@@ -296,7 +308,7 @@ impl BlockchainConfig {
             // special account adresses are stored in hashmap
             // config account is special too
             Ok(
-                self.raw_config.config_addr == account_id || 
+                self.raw_config.config_addr == account_id ||
                 self.special_contracts.get_raw(account_id)?.is_some()
             )
         } else {
