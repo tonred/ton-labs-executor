@@ -2,7 +2,7 @@
 build = 'build.rs'
 edition = '2018'
 name = 'ton_executor'
-version = '1.15.50'
+version = '1.15.54'
 
 [dependencies]
 ton_block = { git = "https://github.com/broxus/ton-labs-block.git" }

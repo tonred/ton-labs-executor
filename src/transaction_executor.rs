@@ -330,7 +330,7 @@ pub trait TransactionExecutor {
         acc_balance: &mut CurrencyCollection,
         msg_balance: &CurrencyCollection,
         state_libs: HashmapE, // masterchain libraries
-        smc_info: SmartContractInfo,
+        mut smc_info: SmartContractInfo,
         stack: Stack,
         is_masterchain: bool,
         is_special: bool,
@@ -415,8 +415,12 @@ pub trait TransactionExecutor {
         libs.push(result_acc.libraries().inner());
         libs.push(state_libs);
 
+        smc_info.set_mycode(code.clone());
         let mut vm = VMSetup::new(code.into())
-            .set_contract_info(smc_info, self.config().raw_config().has_capability(ton_block::GlobalCapabilities::CapInitCodeHash))?
+            .set_contract_info_with_config(
+                smc_info,
+                self.config()
+            )?
             .set_stack(stack)
             .set_data(data)?
             .set_libraries(libs)
