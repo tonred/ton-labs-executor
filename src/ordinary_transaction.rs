@@ -1,5 +1,5 @@
 /*
-* Copyright (C) 2019-2021 TON Labs. All Rights Reserved.
+* Copyright (C) 2019-2022 TON Labs. All Rights Reserved.
 *
 * Licensed under the SOFTWARE EVALUATION License (the "License"); you may not use
 * this file except in compliance with the License.
@@ -12,8 +12,8 @@
 */
 
 use crate::{
-    blockchain_config::{BlockchainConfig, CalcMsgFwdFees}, error::ExecutorError, ExecuteParams,
-    TransactionExecutor, VERSION_BLOCK_REVERT_MESSAGES_WITH_ANYCAST_ADDRESSES
+    ActionPhaseResult, blockchain_config::{BlockchainConfig, CalcMsgFwdFees}, error::ExecutorError,
+    ExecuteParams, TransactionExecutor, VERSION_BLOCK_REVERT_MESSAGES_WITH_ANYCAST_ADDRESSES
 };
 #[cfg(feature = "timings")]
 use std::sync::atomic::AtomicU64;
@@ -24,12 +24,13 @@ use ton_block::{
     AccStatusChange, Account, AccountStatus, AddSub, CommonMsgInfo, Grams, Message, Serializable,
     TrBouncePhase, TrComputePhase, Transaction, TransactionDescr, TransactionDescrOrdinary, MASTERCHAIN_ID
 };
-use ton_types::{error, fail, Result};
+use ton_types::{error, fail, Result, HashmapType};
 use ton_vm::{
     boolean, int,
-    stack::{integer::IntegerData, Stack, StackItem},
+    stack::{integer::IntegerData, Stack, StackItem}, SmartContractInfo,
 };
 use ton_vm::executor::BehaviorModifiers;
+
 
 
 
@@ -82,15 +83,15 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         #[cfg(feature="timings")]
         let mut now = Instant::now();
 
-        let revert_anycast = 
+        let revert_anycast =
             self.config.global_version() >= VERSION_BLOCK_REVERT_MESSAGES_WITH_ANYCAST_ADDRESSES;
 
         let in_msg = in_msg.ok_or_else(|| error!("Ordinary transaction must have input message"))?;
         let in_msg_cell = in_msg.serialize()?; // TODO: get from outside
         let is_masterchain = in_msg.dst_workchain_id() == Some(MASTERCHAIN_ID);
         log::debug!(
-            target: "executor", 
-            "Ordinary transaction executing, in message id: {:x}", 
+            target: "executor",
+            "Ordinary transaction executing, in message id: {:x}",
             in_msg_cell.repr_hash()
         );
         let (bounce, is_ext_msg) = match in_msg.header() {
@@ -102,11 +103,6 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         let account_address = in_msg.dst_ref().ok_or_else(|| ExecutorError::TrExecutorError(
             format!("Input message {:x} has no dst address", in_msg_cell.repr_hash())
         ))?;
-        if revert_anycast {
-            if account_address.rewrite_pfx().is_some() {
-                fail!(ExecutorError::TrExecutorError("Anycast on dst address".to_string()))
-            }
-        }
         let account_id = match account.get_id() {
             Some(account_id) => {
                 log::debug!(target: "executor", "Account = {:x}", account_id);
@@ -122,7 +118,9 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         let mut msg_balance = in_msg.get_value().cloned().unwrap_or_default();
         let ihr_delivered = false;  // ihr is disabled because it does not work
         if !ihr_delivered {
-            msg_balance.grams.0 += in_msg.int_header().map_or(0, |h| h.ihr_fee.0);
+            if let Some(h) = in_msg.int_header() {
+                msg_balance.grams += h.ihr_fee;
+            }
         }
         log::debug!(target: "executor", "acc_balance: {}, msg_balance: {}, credit_first: {}",
             acc_balance.grams, msg_balance.grams, !bounce);
@@ -142,10 +140,19 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             ..TransactionDescrOrdinary::default()
         };
 
+        if revert_anycast && account_address.rewrite_pfx().is_some() {
+            description.aborted = true;
+            tr.set_end_status(account.status());
+            params.last_tr_lt.store(lt, Ordering::Relaxed);
+            account.set_last_tr_time(lt);
+            tr.write_description(&TransactionDescr::Ordinary(description))?;
+            return Ok(tr);
+        }
+
         // first check if contract can pay for importing external message
         if is_ext_msg && !is_special {
             // extranal message comes serialized
-            let in_fwd_fee = self.config.get_fwd_prices(is_masterchain).fwd_fee(&in_msg_cell);
+            let in_fwd_fee = self.config.get_fwd_prices(is_masterchain).fwd_fee_checked(&in_msg_cell)?;
             log::debug!(target: "executor", "import message fee: {}, acc_balance: {}", in_fwd_fee, acc_balance.grams);
             if !acc_balance.grams.sub(&in_fwd_fee)? {
                 fail!(ExecutorError::NoFundsToImportMsg)
@@ -163,6 +170,8 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 )
             };
         }
+        let due_before_storage = account.due_payment().map(|due| due.as_u128());
+        let mut storage_fee;
         description.storage_ph = match self.storage_phase(
             account,
             &mut acc_balance,
@@ -170,7 +179,16 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             is_masterchain,
             is_special
         ) {
-            Ok(storage_ph) => Some(storage_ph),
+            Ok(storage_ph) => {
+                storage_fee = storage_ph.storage_fees_collected.as_u128();
+                if let Some(due) = &storage_ph.storage_fees_due {
+                    storage_fee += due.as_u128()
+                }
+                if let Some(due) = due_before_storage {
+                    storage_fee -= due;
+                }
+                Some(storage_ph)
+            },
             Err(e) => fail!(
                 ExecutorError::TrExecutorError(
                     format!("cannot create storage phase of a new transaction for smart contract for reason {}", e)
@@ -178,8 +196,8 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             )
         };
 
-        if description.credit_first && msg_balance.grams.0 > acc_balance.grams.0{
-            msg_balance.grams.0 = acc_balance.grams.0;
+        if description.credit_first && msg_balance.grams > acc_balance.grams {
+            msg_balance.grams = acc_balance.grams;
         }
 
         log::debug!(target: "executor",
@@ -207,13 +225,23 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             now = Instant::now();
         }
 
-        let smci = self.build_contract_info(
-            &acc_balance, account_address, params.block_unixtime, params.block_lt, lt, params.seed_block
-        );
+        let config_params = self.config().raw_config().config_params.data().cloned();
+        let mut smc_info = SmartContractInfo {
+            capabilities: self.config().raw_config().capabilities(),
+            myself: account_address.serialize().unwrap_or_default().into(),
+            block_lt: params.block_lt,
+            trans_lt: lt,
+            unix_time: params.block_unixtime,
+            seq_no: params.seq_no,
+            balance: acc_balance.clone(),
+            config_params,
+            ..Default::default()
+        };
+        smc_info.calc_rand_seed(params.seed_block, &account_address.address().get_bytestring(0));
         let mut stack = Stack::new();
         stack
-            .push(int!(acc_balance.grams.0))
-            .push(int!(msg_balance.grams.0))
+            .push(int!(acc_balance.grams.as_u128()))
+            .push(int!(msg_balance.grams.as_u128()))
             .push(StackItem::Cell(in_msg_cell))
             .push(StackItem::Slice(in_msg.body().unwrap_or_default()))
             .push(boolean!(is_ext_msg));
@@ -224,11 +252,13 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             &mut acc_balance,
             &msg_balance,
             params.state_libs,
-            smci,
+            smc_info,
             stack,
+            storage_fee,
             is_masterchain,
             is_special,
-            params.debug
+            params.debug,
+            params.trace_callback
         ) {
             Ok((compute_ph, actions, new_data)) => (compute_ph, actions, new_data),
             Err(e) =>
@@ -245,11 +275,12 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         };
         let mut out_msgs = vec![];
         let mut action_phase_processed = false;
-        let mut compute_phase_gas_fees = Grams(0);
+        let mut compute_phase_gas_fees = Grams::zero();
+        let mut copyleft = None;
         description.compute_ph = compute_ph;
         description.action = match &description.compute_ph {
             TrComputePhase::Vm(phase) => {
-                compute_phase_gas_fees = phase.gas_fees.clone();
+                compute_phase_gas_fees = phase.gas_fees;
                 tr.add_fee_grams(&phase.gas_fees)?;
                 if phase.success {
                     log::debug!(target: "executor", "compute_phase: success");
@@ -257,20 +288,24 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                     action_phase_processed = true;
                     // since the balance is not used anywhere else if we have reached this point,
                     // then we can change it here
-                    match self.action_phase(
+                    match self.action_phase_with_copyleft(
                         &mut tr,
                         account,
                         &original_acc_balance,
                         &mut acc_balance,
                         &mut msg_balance,
-                        &phase.gas_fees,
+                        &compute_phase_gas_fees,
                         actions.unwrap_or_default(),
                         new_data,
                         is_special
                     ) {
-                        Ok((action_ph, msgs)) => {
-                            out_msgs = msgs;
-                            Some(action_ph)
+                        Ok(ActionPhaseResult{phase, messages, copyleft_reward}) => {
+                            out_msgs = messages;
+                            if let Some(copyleft_reward) = &copyleft_reward {
+                                tr.total_fees_mut().grams.sub(&copyleft_reward.reward)?;
+                            }
+                            copyleft = copyleft_reward;
+                            Some(phase)
                         }
                         Err(e) => fail!(
                             ExecutorError::TrExecutorError(
@@ -303,12 +338,9 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                     target: "executor",
                     "action_phase: present: success={}, err_code={}", phase.success, phase.result_code
                 );
-                match phase.status_change {
-                    AccStatusChange::Deleted => {
-                        *account = Account::default();
-                        description.destroyed = true;
-                    },
-                    _ => ()
+                if AccStatusChange::Deleted == phase.status_change {
+                    *account = Account::default();
+                    description.destroyed = true;
                 }
                 !phase.success
             }
@@ -350,20 +382,13 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             if let Some(TrBouncePhase::Ok(_)) = description.bounce {
                 log::debug!(target: "executor", "restore balance {} => {}", acc_balance.grams, original_acc_balance.grams);
                 acc_balance = original_acc_balance;
-                if (account.status() == AccountStatus::AccStateUninit) && acc_balance.is_zero()? {
-                    *account = Account::default();
-                }
-            } else {
-                if account.is_none() && !acc_balance.is_zero()? {
-                    *account = Account::uninit(
-                        in_msg.dst().ok_or_else(|| ExecutorError::TrExecutorError(
-                            "cannot create bounce phase of a new transaction for smart contract".to_string()
-                        ))?,
-                        0,
-                        last_paid,
-                        acc_balance.clone()
-                    );
-                }
+            } else if account.is_none() && !acc_balance.is_zero()? {
+                *account = Account::uninit(
+                    account_address.clone(),
+                    0,
+                    last_paid,
+                    acc_balance.clone()
+                );
             }
         }
         if (account.status() == AccountStatus::AccStateUninit) && acc_balance.is_zero()? {
@@ -379,6 +404,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         tr.write_description(&TransactionDescr::Ordinary(description))?;
         #[cfg(feature="timings")]
         self.timings[2].fetch_add(now.elapsed().as_micros() as u64, Ordering::SeqCst);
+        tr.set_copyleft_reward(copyleft);
         Ok(tr)
     }
     fn ordinary_transaction(&self) -> bool { true }
@@ -389,8 +415,8 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             Some(in_msg) => in_msg,
             None => return stack
         };
-        let acc_balance = int!(account.balance().map(|value| value.grams.0).unwrap_or_default());
-        let msg_balance = int!(in_msg.get_value().map(|value| value.grams.0).unwrap_or_default());
+        let acc_balance = int!(account.balance().map_or(0, |value| value.grams.as_u128()));
+        let msg_balance = int!(in_msg.get_value().map_or(0, |value| value.grams.as_u128()));
         let function_selector = boolean!(in_msg.is_inbound_external());
         let body_slice = in_msg.body().unwrap_or_default();
         let in_msg_cell = in_msg.serialize().unwrap_or_default();

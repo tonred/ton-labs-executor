@@ -1,5 +1,5 @@
 /*
-* Copyright (C) 2019-2021 TON Labs. All Rights Reserved.
+* Copyright (C) 2019-2022 TON Labs. All Rights Reserved.
 *
 * Licensed under the SOFTWARE EVALUATION License (the "License"); you may not use
 * this file except in compliance with the License.
@@ -11,6 +11,7 @@
 * limitations under the License.
 */
 
+use ton_block::GlobalCapabilities;
 use ton_types::{Cell, HashmapE, SliceData, Result};
 use ton_vm::{
     executor::{Engine, BehaviorModifiers, gas::gas_state::Gas}, smart_contract_info::SmartContractInfo,
@@ -30,11 +31,12 @@ pub struct VMSetup {
 }
 
 impl VMSetup {
+
     /// Creates new instance of VMSetup with contract code.
     /// Initializes some registers of TVM with predefined values.
-    pub fn new(code: SliceData) -> Self {
+    pub fn with_capabilites(code: SliceData, capabilities: u64) -> Self {
         VMSetup {
-            vm: Engine::new(),
+            vm: Engine::with_capabilities(capabilities),
             code,
             ctrls: SaveList::new(),
             stack: None,
@@ -43,19 +45,35 @@ impl VMSetup {
         }
     }
 
-    /// Sets SmartContractInfo for TVM register c7
-    pub fn set_contract_info_with_config(mut self, sci: SmartContractInfo, config: &BlockchainConfig) -> Result<VMSetup> {
-        self.ctrls.put(7, &mut sci.into_temp_data_with_init_code_hash(
-            config.has_capability(ton_block::GlobalCapabilities::CapInitCodeHash),
-            config.has_capability(ton_block::GlobalCapabilities::CapMycode)
-        ))?;
+    pub fn set_smart_contract_info(mut self, sci: SmartContractInfo) -> Result<VMSetup> {
+        debug_assert_ne!(sci.capabilities, 0);
+        let mut sci = sci.into_temp_data_item();
+        self.ctrls.put(7, &mut sci)?;
         Ok(self)
     }
 
     /// Sets SmartContractInfo for TVM register c7
-    pub fn set_contract_info(mut self, sci: SmartContractInfo, with_init_code_hash: bool) -> Result<VMSetup> {
-        self.ctrls.put(7, &mut sci.into_temp_data_with_init_code_hash(with_init_code_hash, false))?;
-        Ok(self)
+    #[deprecated]
+    pub fn set_contract_info_with_config(
+        self,
+        mut sci: SmartContractInfo,
+        config: &BlockchainConfig
+    ) -> Result<VMSetup> {
+        sci.capabilities |= config.raw_config().capabilities();
+        self.set_smart_contract_info(sci)
+    }
+
+    /// Sets SmartContractInfo for TVM register c7
+    #[deprecated]
+    pub fn set_contract_info(
+        self, 
+        mut sci: SmartContractInfo, 
+        with_init_code_hash: bool
+    ) -> Result<VMSetup> {
+        if with_init_code_hash {
+            sci.capabilities |= GlobalCapabilities::CapInitCodeHash as u64;
+        }
+        self.set_smart_contract_info(sci)
     }
 
     /// Sets persistent data for contract in register c4
@@ -124,6 +142,12 @@ impl VMSetup {
                 .unwrap();
             assert_eq!(balance_in_smc, balance_in_stack);
         }
-        self.vm.setup_with_libraries(self.code, Some(self.ctrls), self.stack, self.gas, self.libraries)
+        self.vm.setup_with_libraries(
+            self.code, 
+            Some(self.ctrls), 
+            self.stack, 
+            self.gas, 
+            self.libraries
+        )
     }
 }
