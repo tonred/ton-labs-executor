@@ -229,14 +229,14 @@ impl Default for BlockchainConfig {
             storage_prices: AccStoragePrices::default(),
             special_contracts: Self::get_default_special_contracts(),
             raw_config: Self::get_defult_raw_config(),
-            global_version: 0,
+            global_version: 20,
             capabilities: 0x2e,
         }
     }
 }
 
 impl BlockchainConfig {
-  
+
     fn get_default_special_contracts() -> FundamentalSmcAddresses {
         let mut map = FundamentalSmcAddresses::default();
         map.add_key(&UInt256::with_array([0x33u8; 32])).unwrap();
