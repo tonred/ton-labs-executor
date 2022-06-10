@@ -229,7 +229,7 @@ impl Default for BlockchainConfig {
             storage_prices: AccStoragePrices::default(),
             special_contracts: Self::get_default_special_contracts(),
             raw_config: Self::get_defult_raw_config(),
-            global_version: 20,
+            global_version: 0,
             capabilities: 0x2e,
         }
     }
@@ -252,6 +252,16 @@ impl BlockchainConfig {
             config_addr: [0x55; 32].into(),
             ..ConfigParams::default()
         };
+
+        params
+            .set_config(
+                ton_block::ConfigParamEnum::ConfigParam8(ton_block::ConfigParam8 {
+                global_version: ton_block::GlobalVersion {
+                    version: 0,
+                    capabilities: 0x2e
+                }
+            }))
+            .expect("Shouldn't fail");
 
         let mut workchains = ton_block::ConfigParam12::default();
 
