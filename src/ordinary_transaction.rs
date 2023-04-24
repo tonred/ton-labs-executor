@@ -12,24 +12,26 @@
 */
 
 use crate::{
-    ActionPhaseResult, blockchain_config::{BlockchainConfig, CalcMsgFwdFees}, error::ExecutorError,
+    ActionPhaseResult, blockchain_config::BlockchainConfig, error::ExecutorError,
     ExecuteParams, TransactionExecutor, VERSION_BLOCK_REVERT_MESSAGES_WITH_ANYCAST_ADDRESSES
 };
 #[cfg(feature = "timings")]
 use std::sync::atomic::AtomicU64;
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::atomic::Ordering;
 #[cfg(feature = "timings")]
 use std::time::Instant;
 use ton_block::{
-    AccStatusChange, Account, AccountStatus, AddSub, CommonMsgInfo, Grams, Message, Serializable,
-    TrBouncePhase, TrComputePhase, Transaction, TransactionDescr, TransactionDescrOrdinary, MASTERCHAIN_ID
+    AccStatusChange, Account, AccountStatus, AddSub, CommonMsgInfo, Grams, Message,
+    Serializable, TrBouncePhase, TrComputePhase, Transaction, TransactionDescr,
+    TransactionDescrOrdinary, MASTERCHAIN_ID, GlobalCapabilities
 };
-use ton_types::{error, fail, Result, HashmapType};
+use ton_types::{error, fail, Result, HashmapType, SliceData};
 use ton_vm::{
     boolean, int,
     stack::{integer::IntegerData, Stack, StackItem}, SmartContractInfo,
 };
 use ton_vm::executor::BehaviorModifiers;
+
 
 
 
@@ -152,7 +154,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         // first check if contract can pay for importing external message
         if is_ext_msg && !is_special {
             // extranal message comes serialized
-            let in_fwd_fee = self.config.get_fwd_prices(is_masterchain).fwd_fee_checked(&in_msg_cell)?;
+            let in_fwd_fee = self.config.calc_fwd_fee(is_masterchain, &in_msg_cell)?;
             log::debug!(target: "executor", "import message fee: {}, acc_balance: {}", in_fwd_fee, acc_balance.grams);
             if !acc_balance.grams.sub(&in_fwd_fee)? {
                 fail!(ExecutorError::NoFundsToImportMsg)
@@ -228,7 +230,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         let config_params = self.config().raw_config().config_params.data().cloned();
         let mut smc_info = SmartContractInfo {
             capabilities: self.config().raw_config().capabilities(),
-            myself: account_address.serialize().unwrap_or_default().into(),
+            myself: SliceData::load_builder(account_address.write_to_new_cell().unwrap_or_default()).unwrap(),
             block_lt: params.block_lt,
             trans_lt: lt,
             unix_time: params.block_unixtime,
@@ -251,33 +253,28 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             account,
             &mut acc_balance,
             &msg_balance,
-            params.state_libs,
             smc_info,
             stack,
             storage_fee,
             is_masterchain,
             is_special,
-            params.debug,
-            params.trace_callback
+            &params,
         ) {
             Ok((compute_ph, actions, new_data)) => (compute_ph, actions, new_data),
-            Err(e) =>
-                if let Some(e) = e.downcast_ref::<ExecutorError>() {
-                    match e {
-                        ExecutorError::NoAcceptError(num, stack) => fail!(
-                            ExecutorError::NoAcceptError(*num, stack.clone())
-                        ),
-                        _ => fail!("Unknown error")
-                    }
-                } else {
-                    fail!(ExecutorError::TrExecutorError(e.to_string()))
+            Err(e) => {
+                log::debug!(target: "executor", "compute_phase error: {}", e);
+                match e.downcast_ref::<ExecutorError>() {
+                    Some(ExecutorError::NoAcceptError(_, _)) => return Err(e),
+                    _ => fail!(ExecutorError::TrExecutorError(e.to_string()))
                 }
+            }
         };
         let mut out_msgs = vec![];
         let mut action_phase_processed = false;
         let mut compute_phase_gas_fees = Grams::zero();
         let mut copyleft = None;
         description.compute_ph = compute_ph;
+        let mut new_acc_balance = acc_balance.clone();
         description.action = match &description.compute_ph {
             TrComputePhase::Vm(phase) => {
                 compute_phase_gas_fees = phase.gas_fees;
@@ -292,11 +289,12 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                         &mut tr,
                         account,
                         &original_acc_balance,
-                        &mut acc_balance,
+                        &mut new_acc_balance,
                         &mut msg_balance,
                         &compute_phase_gas_fees,
                         actions.unwrap_or_default(),
                         new_data,
+                        account_address,
                         is_special
                     ) {
                         Ok(ActionPhaseResult{phase, messages, copyleft_reward}) => {
@@ -342,6 +340,9 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                     *account = Account::default();
                     description.destroyed = true;
                 }
+                if phase.success {
+                    acc_balance = new_acc_balance;
+                }
                 !phase.success
             }
             None => {
@@ -352,18 +353,16 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
 
         log::debug!(target: "executor", "Desciption.aborted {}", description.aborted);
         if description.aborted && !is_ext_msg && bounce {
-            if !action_phase_processed {
+            if !action_phase_processed || self.config().has_capability(GlobalCapabilities::CapBounceAfterFailedAction) {
                 log::debug!(target: "executor", "bounce_phase");
-                let my_addr = account.get_addr().unwrap_or(&in_msg.dst().ok_or_else(|| ExecutorError::TrExecutorError(
-                    "Or account address or in_msg dst address should be present".to_string()
-                ))?).clone();
                 description.bounce = match self.bounce_phase(
                     msg_balance.clone(),
                     &mut acc_balance,
                     &compute_phase_gas_fees,
                     in_msg,
                     &mut tr,
-                    &my_addr
+                    account_address,
+                    params.block_version,
                 ) {
                     Ok((bounce_ph, Some(bounce_msg))) => {
                         out_msgs.push(bounce_msg);

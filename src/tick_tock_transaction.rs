@@ -1,5 +1,5 @@
 /*
-* Copyright (C) 2019-2021 TON Labs. All Rights Reserved.
+* Copyright (C) 2019-2022 TON Labs. All Rights Reserved.
 *
 * Licensed under the SOFTWARE EVALUATION License (the "License"); you may not use
 * this file except in compliance with the License.
@@ -13,12 +13,12 @@
 
 use crate::{blockchain_config::BlockchainConfig, ExecuteParams, TransactionExecutor, error::ExecutorError, ActionPhaseResult};
 
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::atomic::Ordering;
 use ton_block::{
     Account, CurrencyCollection, Grams, Message, TrComputePhase, Transaction,
     TransactionDescr, TransactionDescrTickTock, TransactionTickTock, Serializable
 };
-use ton_types::{fail, Result, HashmapType};
+use ton_types::{fail, Result, HashmapType, SliceData};
 use ton_vm::{
     boolean, int,
     stack::{integer::IntegerData, Stack, StackItem}, SmartContractInfo,
@@ -111,7 +111,7 @@ impl TransactionExecutor for TickTockTransactionExecutor {
         let config_params = self.config().raw_config().config_params.data().cloned();
         let mut smc_info = SmartContractInfo {
             capabilities: self.config().raw_config().capabilities(),
-            myself: account_address.serialize().unwrap_or_default().into(),
+            myself: SliceData::load_builder(account_address.write_to_new_cell().unwrap_or_default()).unwrap(),
             block_lt: params.block_lt,
             trans_lt: lt,
             unix_time: params.block_unixtime,
@@ -124,7 +124,7 @@ impl TransactionExecutor for TickTockTransactionExecutor {
         let mut stack = Stack::new();
         stack
             .push(int!(account.balance().map_or(0, |value| value.grams.as_u128())))
-            .push(StackItem::integer(IntegerData::from_unsigned_bytes_be(&account_id.get_bytestring(0))))
+            .push(StackItem::integer(IntegerData::from_unsigned_bytes_be(account_id.get_bytestring(0))))
             .push(boolean!(self.tt.is_tock()))
             .push(int!(-2));
         log::debug!(target: "executor", "compute_phase {}", lt);
@@ -133,26 +133,21 @@ impl TransactionExecutor for TickTockTransactionExecutor {
             account,
             &mut acc_balance,
             &CurrencyCollection::default(),
-            params.state_libs,
             smc_info,
             stack,
             storage_fee,
             is_masterchain,
             is_special,
-            params.debug,
-            params.trace_callback,
+            &params,
         ) {
             Ok((compute_ph, actions, new_data)) => (compute_ph, actions, new_data),
-            Err(e) =>
-                if let Some(e) = e.downcast_ref::<ExecutorError>() {
-                    match e {
-                        ExecutorError::NoAcceptError(num, stack) =>
-                            fail!(ExecutorError::NoAcceptError(*num, stack.clone())),
-                        _ => fail!("Unknown error")
-                    }
-                } else {
-                    fail!(ExecutorError::TrExecutorError(e.to_string()))
+            Err(e) => {
+                log::debug!(target: "executor", "compute_phase error: {}", e);
+                match e.downcast_ref::<ExecutorError>() {
+                    Some(ExecutorError::NoAcceptError(_, _)) => return Err(e),
+                    _ => fail!(ExecutorError::TrExecutorError(e.to_string()))
                 }
+            }
         };
         let mut out_msgs = vec![];
         description.compute_ph = compute_ph;
@@ -171,6 +166,7 @@ impl TransactionExecutor for TickTockTransactionExecutor {
                         &Grams::zero(),
                         actions.unwrap_or_default(),
                         new_data,
+                        &account_address,
                         is_special
                     ) {
                         Ok(ActionPhaseResult{phase, messages, .. }) => {
@@ -231,10 +227,9 @@ impl TransactionExecutor for TickTockTransactionExecutor {
         let mut stack = Stack::new();
         stack
             .push(int!(account_balance))
-            .push(StackItem::integer(IntegerData::from_unsigned_bytes_be(&account_id.get_bytestring(0))))
+            .push(StackItem::integer(IntegerData::from_unsigned_bytes_be(account_id.get_bytestring(0))))
             .push(boolean!(self.tt.is_tock()))
             .push(int!(-2));
         stack
     }
 }
-

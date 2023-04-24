@@ -15,22 +15,23 @@
 use crate::{
     blockchain_config::{BlockchainConfig, CalcMsgFwdFees},
     error::ExecutorError,
-    vmsetup::VMSetup,
+    vmsetup::{VMSetup, VMSetupContext},
+    VERSION_BLOCK_NEW_CALCULATION_BOUNCED_STORAGE,
 };
-use std::collections::LinkedList;
+use std::{collections::LinkedList, cmp::min};
 
 use std::{
+    convert::TryInto,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    convert::TryInto
 };
 use ton_block::{
     AccStatusChange, Account, AccountStatus, AddSub, CommonMsgInfo, ComputeSkipReason,
     CopyleftReward, CurrencyCollection, Deserializable, ExtraCurrencyCollection, GasLimitsPrices,
     GetRepresentationHash, GlobalCapabilities, Grams, HashUpdate, Message, MsgAddressInt,
-    OutAction, OutActions, Serializable, StorageUsedShort, TrActionPhase, TrBouncePhase,
+    OutAction, OutActions, Serializable, StateInit, StorageUsedShort, TrActionPhase, TrBouncePhase,
     TrComputePhase, TrComputePhaseVm, TrCreditPhase, TrStoragePhase, Transaction, WorkchainFormat,
     BASE_WORKCHAIN_ID, MASTERCHAIN_ID, RESERVE_ALL_BUT, RESERVE_IGNORE_ERROR, RESERVE_PLUS_ORIG,
     RESERVE_REVERSE, RESERVE_VALID_MODES, SENDMSG_ALL_BALANCE, SENDMSG_DELETE_IF_EMPTY,
@@ -38,14 +39,13 @@ use ton_block::{
     SENDMSG_VALID_FLAGS,
 };
 use ton_types::{
-    error, fail, AccountId, Cell, ExceptionCode, HashmapE, HashmapType, IBitstring, Result, UInt256,
+    error, fail, AccountId, Cell, ExceptionCode, HashmapE, HashmapType, IBitstring, Result, UInt256, SliceData,
 };
-use ton_vm::executor::{Engine, EngineTraceInfo};
 use ton_vm::{
     error::tvm_exception,
     executor::{gas::gas_state::Gas, IndexProvider, BehaviorModifiers},
     smart_contract_info::SmartContractInfo,
-    stack::{Stack, StackItem},
+    stack::Stack,
 };
 
 const RESULT_CODE_ACTIONLIST_INVALID:            i32 = 32;
@@ -66,7 +66,7 @@ const MAX_ACTIONS: usize = 255;
 const MAX_MSG_BITS: usize = 1 << 21;
 const MAX_MSG_CELLS: usize = 1 << 13;
 
-#[derive(PartialEq, Debug)]
+#[derive(Eq, PartialEq, Debug)]
 pub enum IncorrectCheckRewrite {
     Anycast,
     Other
@@ -83,8 +83,11 @@ pub struct ExecuteParams {
     pub last_tr_lt: Arc<AtomicU64>,
     pub seed_block: UInt256,
     pub debug: bool,
-    pub trace_callback: Option<Arc<dyn Fn(&Engine, &EngineTraceInfo) + Send + Sync>>,
+    pub trace_callback: Option<Arc<ton_vm::executor::TraceCallback>>,
     pub index_provider: Option<Arc<dyn IndexProvider>>,
+    pub behavior_modifiers: Option<BehaviorModifiers>,
+    pub block_version: u32,
+    pub signature_id: i32,
 }
 
 pub struct ActionPhaseResult {
@@ -106,7 +109,7 @@ impl ActionPhaseResult {
 impl Default for ExecuteParams {
     fn default() -> Self {
         Self {
-            state_libs: HashmapE::default(),
+            state_libs: HashmapE::with_bit_len(32),
             block_unixtime: 0,
             block_lt: 0,
             seq_no: 0,
@@ -115,6 +118,9 @@ impl Default for ExecuteParams {
             debug: false,
             trace_callback: None,
             index_provider: None,
+            behavior_modifiers: None,
+            block_version: 0,
+            signature_id: 0,
         }
     }
 }
@@ -167,7 +173,7 @@ pub trait TransactionExecutor {
         let config_params = self.config().raw_config().config_params.data().cloned();
         let mut smci = SmartContractInfo {
             capabilities: self.config().raw_config().capabilities(),
-            myself: acc_address.serialize().unwrap_or_default().into(),
+            myself: SliceData::load_builder(acc_address.write_to_new_cell().unwrap_or_default()).unwrap(),
             block_lt,
             trans_lt,
             unix_time,
@@ -211,20 +217,19 @@ pub trait TransactionExecutor {
                 )
             )
         }
-        let storage_fee = match acc.storage_info() {
+        let mut fee = match acc.storage_info() {
             Some(storage_info) => {
                 self.config().calc_storage_fee(
                     storage_info,
                     is_masterchain,
                     tr.now(),
-                )
+                )?
             }
             None => {
                 log::debug!(target: "executor", "Account::None");
                 return Ok(Default::default())
             }
         };
-        let mut fee = Grams::new(storage_fee)?;
         if let Some(due_payment) = acc.due_payment() {
             fee.add(due_payment)?;
             acc.set_due_payment(None);
@@ -277,7 +282,7 @@ pub trait TransactionExecutor {
         acc_balance: &mut CurrencyCollection,
     ) -> Result<TrCreditPhase> {
         let collected = if let Some(due_payment) = acc.due_payment() {
-            let collected = *std::cmp::min(due_payment, &msg_balance.grams);
+            let collected = *min(due_payment, &msg_balance.grams);
             msg_balance.grams.sub(&collected)?;
             let mut due_payment_remaining = *due_payment;
             due_payment_remaining.sub(&collected)?;
@@ -315,23 +320,22 @@ pub trait TransactionExecutor {
         acc: &mut Account,
         acc_balance: &mut CurrencyCollection,
         msg_balance: &CurrencyCollection,
-        state_libs: HashmapE, // masterchain libraries
         mut smc_info: SmartContractInfo,
         stack: Stack,
         storage_fee: u128,
         is_masterchain: bool,
         is_special: bool,
-        debug: bool,
-        trace_callback: Option<Arc<dyn Fn(&Engine, &EngineTraceInfo) + Send + Sync>>,
+        params: &ExecuteParams,
     ) -> Result<(TrComputePhase, Option<Cell>, Option<Cell>)> {
         let mut result_acc = acc.clone();
         let mut vm_phase = TrComputePhaseVm::default();
         let init_code_hash = self.config().has_capability(GlobalCapabilities::CapInitCodeHash);
+        let libs_disabled = !self.config().has_capability(GlobalCapabilities::CapSetLibCode);
         let is_external = if let Some(msg) = msg {
             if let Some(header) = msg.int_header() {
                 log::debug!(target: "executor", "msg internal, bounce: {}", header.bounce);
                 if result_acc.is_none() {
-                    if let Some(new_acc) = account_from_message(msg, msg_balance, true, init_code_hash) {
+                    if let Some(new_acc) = account_from_message(msg, msg_balance, true, init_code_hash, libs_disabled) {
                         result_acc = new_acc;
                         result_acc.set_last_paid(if !is_special {smc_info.unix_time()} else {0});
 
@@ -368,7 +372,7 @@ pub trait TransactionExecutor {
             if let Some(state_init) = msg.state_init() {
                 libs.push(state_init.libraries().inner());
             }
-            if let Some(reason) = compute_new_state(&mut result_acc, acc_balance, msg, init_code_hash) {
+            if let Some(reason) = compute_new_state(&mut result_acc, acc_balance, msg, init_code_hash, libs_disabled) {
                 if !init_code_hash {
                     *acc = result_acc;
                 }
@@ -401,26 +405,36 @@ pub trait TransactionExecutor {
         let code = result_acc.get_code().unwrap_or_default();
         let data = result_acc.get_data().unwrap_or_default();
         libs.push(result_acc.libraries().inner());
-        libs.push(state_libs);
+        libs.push(params.state_libs.clone());
 
         smc_info.set_mycode(code.clone());
         smc_info.set_storage_fee(storage_fee);
         if let Some(init_code_hash) = result_acc.init_code_hash() {
             smc_info.set_init_code_hash(*init_code_hash);
         }
-        let mut vm = VMSetup::with_capabilites(code.into(), self.config().capabilites())
+        let mut vm = VMSetup::with_context(
+            SliceData::load_cell(code)?,
+            VMSetupContext {
+                capabilities: self.config().capabilites(),
+                block_version: params.block_version,
+                signature_id: params.signature_id
+            }
+        )
             .set_smart_contract_info(smc_info)?
             .set_stack(stack)
             .set_data(data)?
             .set_libraries(libs)
             .set_gas(gas)
-            .set_debug(debug)
-            .modify_behavior(self.behavior_modifiers())
+            .set_debug(params.debug)
             .create();
+
+        if let Some(modifiers) = params.behavior_modifiers.clone() {
+            vm.modify_behavior(modifiers);
+        }
 
         //TODO: set vm_init_state_hash
 
-        if let Some(trace_callback) = trace_callback  {
+        if let Some(trace_callback) = params.trace_callback.clone() {
             vm.set_trace_callback(move |engine, info| trace_callback(engine, info));
         }
 
@@ -483,16 +497,16 @@ pub trait TransactionExecutor {
             fail!("can't sub funds: from acc_balance")
         }
 
-        let new_data = if let StackItem::Cell(cell) = vm.get_committed_state().get_root() {
-            Some(cell)
+        let new_data = if let Ok(cell) = vm.get_committed_state().get_root().as_cell() {
+            Some(cell.clone())
         } else {
             log::debug!(target: "executor", "invalid contract, it must be cell in c4 register");
             vm_phase.success = false;
             None
         };
 
-        let out_actions = if let StackItem::Cell(root_cell) = vm.get_committed_state().get_actions() {
-            Some(root_cell)
+        let out_actions = if let Ok(root_cell) = vm.get_committed_state().get_actions().as_cell() {
+            Some(root_cell.clone())
         } else {
             log::debug!(target: "executor", "invalid contract, it must be cell in c5 register");
             vm_phase.success = false;
@@ -522,11 +536,12 @@ pub trait TransactionExecutor {
         compute_phase_fees: &Grams,
         actions_cell: Cell,
         new_data: Option<Cell>,
+        my_addr: &MsgAddressInt,
         is_special: bool,
     ) -> Result<(TrActionPhase, Vec<Message>)> {
         let result = self.action_phase_with_copyleft(
             tr, acc, original_acc_balance, acc_balance, msg_remaining_balance,
-            compute_phase_fees, actions_cell, new_data, is_special)?;
+            compute_phase_fees, actions_cell, new_data, my_addr, is_special)?;
         Ok((result.phase, result.messages))
     }
 
@@ -540,6 +555,7 @@ pub trait TransactionExecutor {
         compute_phase_fees: &Grams,
         actions_cell: Cell,
         new_data: Option<Cell>,
+        my_addr: &MsgAddressInt,
         is_special: bool,
     ) -> Result<ActionPhaseResult> {
         let mut out_msgs = vec![];
@@ -547,6 +563,7 @@ pub trait TransactionExecutor {
         let mut acc_remaining_balance = acc_balance.clone();
         let mut phase = TrActionPhase::default();
         let mut total_reserved_value = CurrencyCollection::default();
+        phase.action_list_hash = actions_cell.repr_hash();
         let mut actions = match OutActions::construct_from_cell(actions_cell) {
             Err(err) => {
                 log::debug!(
@@ -567,7 +584,6 @@ pub trait TransactionExecutor {
             phase.result_code = RESULT_CODE_TOO_MANY_ACTIONS;
             return Ok(ActionPhaseResult::from_phase(phase))
         }
-        phase.action_list_hash = actions.hash()?;
         phase.tot_actions = actions.len() as i16;
 
         let process_err_code = |mut err_code: i32, i: usize, phase: &mut TrActionPhase| -> Result<bool> {
@@ -593,17 +609,6 @@ pub trait TransactionExecutor {
         let mut account_deleted = false;
 
         let mut out_msgs0 = vec![];
-        let my_addr = acc_copy.get_addr()
-            .ok_or_else(|| error!("Not found account address"))?.clone();
-        let workchains = match self.config().raw_config().workchains() {
-            Ok(workchains) => workchains,
-            #[cfg(not(test))]
-            Err(e) => {
-                log::error!(target: "executor", "get workchains error {}", e);
-                fail!("get workchains error {}", e)
-            }
-        };
-
         let copyleft_reward = self.copyleft_action_handler(compute_phase_fees, &mut phase, &actions)?;
         if phase.result_code != 0 {
             return Ok(ActionPhaseResult::from_phase(phase));
@@ -618,42 +623,6 @@ pub trait TransactionExecutor {
             let mut init_balance = acc_remaining_balance.clone();
             let err_code = match std::mem::replace(action, OutAction::None) {
                 OutAction::SendMsg{ mode, mut out_msg } => {
-                    if let Some(header) = out_msg.int_header() {
-                        // let src_workchain_id = my_addr.workchain_id();
-                        match header.dst.workchain_id() {
-                            // allow to send only to -1 from 0 or -1
-                            MASTERCHAIN_ID => {
-                                if my_addr.workchain_id() != MASTERCHAIN_ID && my_addr.workchain_id() != BASE_WORKCHAIN_ID {
-                                    log::error!(target: "executor", "masterchain cannot accept from {} workchain", my_addr.workchain_id());
-                                    fail!("masterchain cannot accept from {} workchain", my_addr.workchain_id())
-                                }
-                            }
-                            // allow to send to self or from master to any which is possible
-                            workchain_id => {
-                                if my_addr.workchain_id() == workchain_id || my_addr.workchain_id() == MASTERCHAIN_ID {
-                                    match workchains.get(&workchain_id) {
-                                        Ok(None) => {
-                                            log::error!(target: "executor", "workchain {} is not deployed", workchain_id);
-                                            fail!("workchain {} is not deployed", workchain_id)
-                                        }
-                                        Err(e) => {
-                                            log::error!(target: "executor", "workchain {} cannot be get {}", workchain_id, e);
-                                            fail!("workchain {} cannot be get {}", workchain_id, e)
-                                        }
-                                        Ok(Some(descr)) => {
-                                            if !descr.accept_msgs {
-                                                log::error!(target: "executor", "cannot send message from {} to {} it doesn't accept", header.src, header.dst);
-                                                fail!("cannot send message from {} to {} it doesn't accept", header.src, header.dst)
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    log::error!(target: "executor", "cannot send message from {} to {} it doesn't allow yet", header.src, header.dst);
-                                    fail!("cannot send message from {} to {} it doesn't allow yet", header.src, header.dst)
-                                }
-                            }
-                        }
-                    }
                     if (mode & SENDMSG_ALL_BALANCE) != 0 {
                         out_msgs0.push((i, mode, out_msg));
                         log::debug!(target: "executor", "Message with flag `SEND_ALL_BALANCE` it will be sent last. Skip it for now.");
@@ -668,7 +637,7 @@ pub trait TransactionExecutor {
                         compute_phase_fees,
                         self.config(),
                         is_special,
-                        &my_addr,
+                        my_addr,
                         &total_reserved_value,
                         &mut account_deleted
                     );
@@ -740,7 +709,7 @@ pub trait TransactionExecutor {
                 compute_phase_fees,
                 self.config(),
                 is_special,
-                &my_addr,
+                my_addr,
                 &total_reserved_value,
                 &mut account_deleted
             );
@@ -801,7 +770,8 @@ pub trait TransactionExecutor {
         compute_phase_fees: &Grams,
         msg: &Message,
         tr: &mut Transaction,
-        _: &MsgAddressInt,
+        my_addr: &MsgAddressInt,
+        block_version: u32,
     ) -> Result<(TrBouncePhase, Option<Message>)> {
         let header = msg.int_header()
             .ok_or_else(|| error!("Not found msg internal header"))?;
@@ -814,13 +784,15 @@ pub trait TransactionExecutor {
             .ok_or_else(|| error!("Not found src in message header"))?.clone();
         let msg_dst = std::mem::replace(&mut header.dst, msg_src);
         header.set_src(msg_dst);
-        match check_rewrite_dest_addr(&header.dst, self.config()) {
+        match check_rewrite_dest_addr(&header.dst, self.config(), my_addr) {
             Ok(new_dst) => {header.dst = new_dst}
             Err(_) => {
                 log::warn!(target: "executor", "Incorrect destination address in a bounced message {}", header.dst);
                 fail!("Incorrect destination address in a bounced message {}", header.dst)
             }
         }
+
+        let is_masterchain = msg.is_masterchain();
 
         // create header for new bounced message and swap src and dst addresses
         header.ihr_disabled = true;
@@ -836,10 +808,10 @@ pub trait TransactionExecutor {
                 body_copy.shrink_data(0..256);
                 builder.append_bytestring(&body_copy)?;
                 if self.config().has_capability(GlobalCapabilities::CapFullBodyInBounced) {
-                    builder.append_reference_cell(body.into_cell());
+                    builder.checked_append_reference(body.into_cell())?;
                 }
             }
-            bounce_msg.set_body(builder.into_cell()?.into());
+            bounce_msg.set_body(SliceData::load_builder(builder)?);
             if self.config().has_capability(GlobalCapabilities::CapFullBodyInBounced) {
                 if let Some(init) = msg.state_init() {
                     bounce_msg.set_state_init(init.clone());
@@ -849,13 +821,18 @@ pub trait TransactionExecutor {
 
         // calculated storage for bounced message is empty
         let serialized_message = bounce_msg.serialize()?;
-        let mut storage = StorageUsedShort::default();
-        storage.append(&serialized_message);
-        let storage_bits = storage.bits() - serialized_message.bit_length() as u64;
-        let storage_cells = storage.cells() - 1;
-        let storage = StorageUsedShort::with_values_checked(storage_cells, storage_bits)?;
-        let fwd_prices = self.config().get_fwd_prices(msg.is_masterchain());
-        let fwd_full_fees = fwd_prices.fwd_fee_checked(&serialized_message)?;
+        let (storage, fwd_full_fees) = if block_version >= VERSION_BLOCK_NEW_CALCULATION_BOUNCED_STORAGE {
+            let mut storage = StorageUsedShort::default();
+            storage.append(&serialized_message);
+            let storage_bits = storage.bits() - serialized_message.bit_length() as u64;
+            let storage_cells = storage.cells() - 1;
+            let fwd_full_fees = self.config().calc_fwd_fee(is_masterchain, &serialized_message)?;
+            (StorageUsedShort::with_values_checked(storage_cells, storage_bits)?, fwd_full_fees)
+        } else {
+            let fwd_full_fees = self.config().calc_fwd_fee(is_masterchain, &Cell::default())?;
+            (StorageUsedShort::with_values_checked(0, 0)?, fwd_full_fees)
+        };
+        let fwd_prices = self.config().get_fwd_prices(is_masterchain);
         let fwd_mine_fees = fwd_prices.mine_fee_checked(&fwd_full_fees)?;
         let fwd_fees = fwd_full_fees - fwd_mine_fees;
 
@@ -960,7 +937,13 @@ pub trait TransactionExecutor {
 /// If account is uninitialized - it can be created with active state.
 /// If account exists - it can be frozen.
 /// Returns computed initial phase.
-fn compute_new_state(acc: &mut Account, acc_balance: &CurrencyCollection, in_msg: &Message, init_code_hash: bool) -> Option<ComputeSkipReason> {
+fn compute_new_state(
+    acc: &mut Account,
+    acc_balance: &CurrencyCollection,
+    in_msg: &Message,
+    init_code_hash: bool,
+    disable_set_lib: bool,
+) -> Option<ComputeSkipReason> {
     log::debug!(target: "executor", "compute_account_state");
     match acc.status() {
         AccountStatus::AccStateNonexist => {
@@ -979,6 +962,10 @@ fn compute_new_state(acc: &mut Account, acc_balance: &CurrencyCollection, in_msg
                 // if msg is a constructor message then
                 // borrow code and data from it and switch account state to 'active'.
                 log::debug!(target: "executor", "message for uninitialized: activated");
+                let text = "Cannot construct account from message with hash";
+                if !check_libraries(state_init, disable_set_lib, text, in_msg) {
+                    return Some(ComputeSkipReason::BadState);
+                }
                 match acc.try_activate_by_init_code_hash(state_init, init_code_hash) {
                     Err(err) => {
                         log::debug!(target: "executor", "reason: {}", err);
@@ -997,6 +984,10 @@ fn compute_new_state(acc: &mut Account, acc_balance: &CurrencyCollection, in_msg
             //and inbound message bear code and data then make some check and unfreeze account
             if !acc_balance.grams.is_zero() { // This check is redundant
                 if let Some(state_init) = in_msg.state_init() {
+                    let text = "Cannot unfreeze account from message with hash";
+                    if !check_libraries(state_init, disable_set_lib, text, in_msg) {
+                        return Some(ComputeSkipReason::BadState);
+                    }
                     log::debug!(target: "executor", "message for frozen: activated");
                     return match acc.try_activate_by_init_code_hash(state_init, init_code_hash) {
                         Err(err) => {
@@ -1036,11 +1027,15 @@ fn is_valid_addr_len(addr_len: u16, min_addr_len: u16, max_addr_len: u16, addr_l
     ((addr_len_step != 0) && ((addr_len - min_addr_len) % addr_len_step == 0)))
 }
 
-fn check_rewrite_dest_addr(dst: &MsgAddressInt, config: &BlockchainConfig) -> std::result::Result<MsgAddressInt, IncorrectCheckRewrite> {
+fn check_rewrite_dest_addr(
+    dst: &MsgAddressInt,
+    config: &BlockchainConfig,
+    my_addr: &MsgAddressInt
+) -> std::result::Result<MsgAddressInt, IncorrectCheckRewrite> {
     let (anycast_opt, addr_len, workchain_id, address, repack);
     match dst {
         MsgAddressInt::AddrVar(dst) => {
-            repack = dst.addr_len.as_u32() == 256 && dst.workchain_id >= -128 && dst.workchain_id < 128;
+            repack = (dst.addr_len.as_u32() == 256) && (dst.workchain_id >= -128) && (dst.workchain_id < 128);
             anycast_opt = dst.anycast.clone();
             addr_len = dst.addr_len.as_u16();
             workchain_id = dst.workchain_id;
@@ -1055,12 +1050,27 @@ fn check_rewrite_dest_addr(dst: &MsgAddressInt, config: &BlockchainConfig) -> st
         }
     }
 
+    let cap_workchains = config.raw_config().has_capability(GlobalCapabilities::CapWorkchains);
     let is_masterchain = workchain_id == MASTERCHAIN_ID;
     if !is_masterchain {
+        if !cap_workchains &&
+           my_addr.workchain_id() != workchain_id && my_addr.workchain_id() != MASTERCHAIN_ID
+        {
+            log::debug!(
+                target: "executor",
+                "cannot send message from {} to {} it doesn't allow yet",
+                my_addr, dst
+            );
+            return Err(IncorrectCheckRewrite::Other);
+        }
         let workchains = config.raw_config().workchains().unwrap_or_default();
         if let Ok(Some(wc)) = workchains.get(&workchain_id) {
             if !wc.accept_msgs {
-                log::debug!(target: "executor", "destination address belongs to workchain {} not accepting new messages", workchain_id);
+                log::debug!(
+                    target: "executor",
+                    "destination address belongs to workchain {} not accepting new messages",
+                    workchain_id
+                );
                 return Err(IncorrectCheckRewrite::Other);
             }
             let (min_addr_len, max_addr_len, addr_len_step) = match wc.format {
@@ -1068,11 +1078,38 @@ fn check_rewrite_dest_addr(dst: &MsgAddressInt, config: &BlockchainConfig) -> st
                 WorkchainFormat::Basic(_) => (256, 256, 0)
             };
             if !is_valid_addr_len(addr_len, min_addr_len, max_addr_len, addr_len_step) {
-                log::debug!(target: "executor", "destination address has length {} invalid for destination workchain {}", addr_len, workchain_id);
+                log::debug!(
+                    target: "executor",
+                    "destination address has length {} invalid for destination workchain {}",
+                    addr_len, workchain_id
+                );
                 return Err(IncorrectCheckRewrite::Other);
             }
         } else {
-            log::debug!(target: "executor", "destination address contains unknown workchain_id {}", workchain_id);
+            log::debug!(
+                target: "executor",
+                "destination address contains unknown workchain_id {}",
+                workchain_id
+            );
+            return Err(IncorrectCheckRewrite::Other);
+        }
+    } else {
+        if !cap_workchains &&
+           my_addr.workchain_id() != MASTERCHAIN_ID && my_addr.workchain_id() != BASE_WORKCHAIN_ID
+        {
+            log::debug!(
+                target: "executor",
+                "masterchain cannot accept from {} workchain",
+                my_addr.workchain_id()
+            );
+            return Err(IncorrectCheckRewrite::Other);
+        }
+        if addr_len != 256 {
+            log::debug!(
+                target: "executor",
+                "destination address has length {} invalid for destination workchain {}",
+                addr_len, workchain_id
+            );
             return Err(IncorrectCheckRewrite::Other);
         }
     }
@@ -1110,7 +1147,7 @@ fn check_rewrite_dest_addr(dst: &MsgAddressInt, config: &BlockchainConfig) -> st
 
     if !repack {
         Ok(dst.clone())
-    } else if addr_len == 256 && workchain_id >= -128 && workchain_id < 128 {
+    } else if addr_len == 256 && (-128..128).contains(&workchain_id) {
         // repack as an addr_std
         MsgAddressInt::with_standart(anycast_opt, workchain_id as i8, address).map_err(|_| {
             IncorrectCheckRewrite::Other
@@ -1164,17 +1201,17 @@ fn outmsg_action_handler(
     let compute_fwd_fee = if is_special {
         Grams::default()
     } else {
-        match msg.serialize().and_then(|cell| fwd_prices.fwd_fee_checked(&cell)) {
-            Err(err) => {
+        msg
+            .serialize()
+            .and_then(|cell| config.calc_fwd_fee(msg.is_masterchain(), &cell))
+            .map_err(|err| {
                 log::error!(target: "executor", "cannot serialize message in action phase : {}", err);
-                return Err(RESULT_CODE_ACTIONLIST_INVALID)
-            }
-            Ok(fee) => fee
-        }
+                RESULT_CODE_ACTIONLIST_INVALID
+            })?
     };
 
     if let Some(int_header) = msg.int_header_mut() {
-        match check_rewrite_dest_addr(&int_header.dst, config) {
+        match check_rewrite_dest_addr(&int_header.dst, config, my_addr) {
             Ok(new_dst) => {int_header.dst = new_dst}
             Err(type_error) => {
                 if type_error == IncorrectCheckRewrite::Anycast {
@@ -1362,7 +1399,7 @@ fn reserve_action_handler(
     }
     if mode & RESERVE_IGNORE_ERROR != 0 {
         // Only grams
-        reserved.grams = std::cmp::min(reserved.grams, acc_remaining_balance.grams);
+        reserved.grams = min(reserved.grams, acc_remaining_balance.grams);
     }
 
     let mut remaining = acc_remaining_balance.clone();
@@ -1386,10 +1423,9 @@ fn reserve_action_handler(
 }
 
 fn setcode_action_handler(acc: &mut Account, code: Cell) -> Option<i32> {
-    log::debug!(target: "executor", "OutAction::SetCode {}\nPrevious code hash: {}\nNew code hash:      {}",
-        code,
-        acc.get_code().unwrap_or_default().repr_hash().to_hex_string(),
-        code.repr_hash().to_hex_string(),
+    log::debug!(target: "executor", "OutAction::SetCode\nPrevious code hash: {:x}\nNew code hash:      {:x}",
+        acc.get_code().unwrap_or_default().repr_hash(),
+        code.repr_hash(),
     );
     match acc.set_code(code) {
         true => None,
@@ -1423,20 +1459,33 @@ fn change_library_action_handler(acc: &mut Account, mode: u8, code: Option<Cell>
     }
 }
 
-fn init_gas(acc_balance: u128, msg_balance: u128, is_external: bool, is_special: bool, is_ordinary: bool, gas_info: &GasLimitsPrices) -> Gas {
+fn init_gas(
+    acc_balance: u128,
+    msg_balance: u128,
+    is_external: bool,
+    is_special: bool,
+    is_ordinary: bool,
+    gas_info: &GasLimitsPrices
+) -> Gas {
     let gas_max = if is_special {
         gas_info.special_gas_limit
     } else {
-        std::cmp::min(gas_info.gas_limit, gas_info.calc_gas(acc_balance))
+        min(
+            (1 << (7 * 8)) - 1, // because gas_limit is stored as VarUInteger7
+            min(gas_info.gas_limit, gas_info.calc_gas(acc_balance))
+        )
     };
     let mut gas_credit = 0;
     let gas_limit = if !is_ordinary {
         gas_max
     } else {
         if is_external {
-            gas_credit = std::cmp::min(gas_info.gas_credit, gas_max);
+            gas_credit = min(
+                (1 << (3 * 8)) - 1, // because gas_credit is stored as VarUInteger3
+                min(gas_info.gas_credit, gas_max)
+            );
         }
-        std::cmp::min(gas_max, gas_info.calc_gas(msg_balance))
+        min(gas_max, gas_info.calc_gas(msg_balance))
     };
     log::debug!(
         target: "executor",
@@ -1444,6 +1493,31 @@ fn init_gas(acc_balance: u128, msg_balance: u128, is_external: bool, is_special:
         gas_max, gas_limit, gas_credit, gas_info.get_real_gas_price()
     );
     Gas::new(gas_limit as i64, gas_credit as i64, gas_max as i64, gas_info.get_real_gas_price() as i64)
+}
+
+fn check_libraries(init: &StateInit, disable_set_lib: bool, text: &str, msg: &Message) -> bool {
+    match init.libraries().len() {
+        Ok(len) => {
+            if !disable_set_lib || len == 0 {
+                true
+            } else {
+                log::trace!(
+                    target: "executor",
+                    "{} {:x} because libraries are disabled",
+                        text, msg.hash().unwrap_or_default()
+                );
+                false
+            }
+        }
+        Err(err) => {
+            log::trace!(
+                target: "executor",
+                "{} {:x} because libraries are broken {}",
+                    text, msg.hash().unwrap_or_default(), err
+            );
+            false
+        }
+    }
 }
 
 /// Calculate new account according to inbound message.
@@ -1454,24 +1528,29 @@ fn account_from_message(
     msg: &Message,
     msg_remaining_balance: &CurrencyCollection,
     check_address: bool,
-    init_code_hash: bool
+    init_code_hash: bool,
+    disable_set_lib: bool,
 ) -> Option<Account> {
     let hdr = msg.int_header()?;
     if let Some(init) = msg.state_init() {
         if init.code().is_some() {
             if !check_address || (init.hash().ok()? == hdr.dst.address()) {
-                return Account::active_by_init_code_hash(
-                    hdr.dst.clone(),
-                    msg_remaining_balance.clone(),
-                    0,
-                    init.clone(),
-                    init_code_hash
-                ).ok();
+                let text = "Cannot construct account from message with hash";
+                if check_libraries(init, disable_set_lib, text, msg) {
+                    return Account::active_by_init_code_hash(
+                        hdr.dst.clone(),
+                        msg_remaining_balance.clone(),
+                        0,
+                        init.clone(),
+                        init_code_hash
+                    ).ok();
+                }
             } else if check_address {
                 log::trace!(
                     target: "executor",
-                    "Cannot construct account from message with hash {:x} because the destination address does not math with hash message code",
-                    msg.hash().unwrap_or_default()
+                    "Cannot construct account from message with hash {:x} \
+                        because the destination address does not math with hash message code",
+                        msg.hash().unwrap_or_default()
                 );
             }
         }

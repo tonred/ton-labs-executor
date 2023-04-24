@@ -1,5 +1,5 @@
 /*
-* Copyright (C) 2019-2022 TON Labs. All Rights Reserved.
+* Copyright (C) 2019-2023 TON Labs. All Rights Reserved.
 *
 * Licensed under the SOFTWARE EVALUATION License (the "License"); you may not use
 * this file except in compliance with the License.
@@ -19,6 +19,12 @@ use ton_vm::{
 };
 use crate::BlockchainConfig;
 
+pub struct VMSetupContext {
+    pub capabilities: u64,
+    pub block_version: u32,
+    pub signature_id: i32,
+}
+
 /// Builder for virtual machine engine. Initialises registers,
 /// stack and code of VM engine. Returns initialized instance of TVM.
 pub struct VMSetup {
@@ -27,21 +33,23 @@ pub struct VMSetup {
     ctrls: SaveList,
     stack: Option<Stack>,
     gas: Option<Gas>,
-    libraries: Vec<HashmapE>
+    libraries: Vec<HashmapE>,
+    ctx: VMSetupContext,
 }
 
 impl VMSetup {
 
     /// Creates new instance of VMSetup with contract code.
     /// Initializes some registers of TVM with predefined values.
-    pub fn with_capabilites(code: SliceData, capabilities: u64) -> Self {
+    pub fn with_context(code: SliceData, ctx: VMSetupContext) -> Self {
         VMSetup {
-            vm: Engine::with_capabilities(capabilities),
+            vm: Engine::with_capabilities(ctx.capabilities),
             code,
             ctrls: SaveList::new(),
             stack: None,
             gas: Some(Gas::empty()),
             libraries: vec![],
+            ctx,
         }
     }
 
@@ -66,8 +74,8 @@ impl VMSetup {
     /// Sets SmartContractInfo for TVM register c7
     #[deprecated]
     pub fn set_contract_info(
-        self, 
-        mut sci: SmartContractInfo, 
+        self,
+        mut sci: SmartContractInfo,
         with_init_code_hash: bool
     ) -> Result<VMSetup> {
         if with_init_code_hash {
@@ -87,7 +95,7 @@ impl VMSetup {
         self.stack = Some(stack);
         self
     }
-    
+
     /// Sets gas for TVM
     pub fn set_gas(mut self, gas: Gas) -> VMSetup {
         self.gas = Some(gas);
@@ -142,12 +150,15 @@ impl VMSetup {
                 .unwrap();
             assert_eq!(balance_in_smc, balance_in_stack);
         }
-        self.vm.setup_with_libraries(
-            self.code, 
-            Some(self.ctrls), 
-            self.stack, 
-            self.gas, 
+        let mut vm = self.vm.setup_with_libraries(
+            self.code,
+            Some(self.ctrls),
+            self.stack,
+            self.gas,
             self.libraries
-        )
+        );
+        vm.set_block_version(self.ctx.block_version);
+        vm.set_signature_id(self.ctx.signature_id);
+        vm
     }
 }

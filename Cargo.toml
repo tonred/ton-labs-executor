@@ -1,5 +1,4 @@
 [package]
-build = "build.rs"
 edition = '2021'
 name = "ton_executor"
 version = "1.15.54"
