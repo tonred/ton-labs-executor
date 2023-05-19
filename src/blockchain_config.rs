@@ -207,6 +207,7 @@ pub struct BlockchainConfig {
     special_contracts: FundamentalSmcAddresses,
     capabilities: u64,
     global_version: u32,
+    global_id: i32,
     raw_config: ConfigParams,
 }
 
@@ -221,7 +222,8 @@ impl Default for BlockchainConfig {
             special_contracts: Self::get_default_special_contracts(),
             raw_config: Self::get_defult_raw_config(),
             global_version: 0,
-            capabilities: 0x2e,
+            global_id: 42,
+            capabilities: 0x52e,
         }
     }
 }
@@ -268,7 +270,7 @@ impl BlockchainConfig {
     }
 
     /// Create `BlockchainConfig` struct with `ConfigParams` taken from blockchain
-    pub fn with_config(config: ConfigParams) -> Result<Self> {
+    pub fn with_config(config: ConfigParams, global_id: i32) -> Result<Self> {
         Ok(BlockchainConfig {
             gas_prices_mc: config.gas_prices(true)?,
             gas_prices_wc: config.gas_prices(false)?,
@@ -278,8 +280,13 @@ impl BlockchainConfig {
             special_contracts: config.fundamental_smc_addr()?,
             capabilities: config.capabilities(),
             global_version: config.global_version(),
+            global_id,
             raw_config: config,
         })
+    }
+
+    pub fn global_id(&self) -> i32 {
+        self.global_id
     }
 
     /// Get `MsgForwardPrices` for message forward fee calculation

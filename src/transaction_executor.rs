@@ -87,7 +87,6 @@ pub struct ExecuteParams {
     pub index_provider: Option<Arc<dyn IndexProvider>>,
     pub behavior_modifiers: Option<BehaviorModifiers>,
     pub block_version: u32,
-    pub signature_id: i32,
 }
 
 pub struct ActionPhaseResult {
@@ -120,7 +119,6 @@ impl Default for ExecuteParams {
             index_provider: None,
             behavior_modifiers: None,
             block_version: 0,
-            signature_id: 0,
         }
     }
 }
@@ -417,7 +415,7 @@ pub trait TransactionExecutor {
             VMSetupContext {
                 capabilities: self.config().capabilites(),
                 block_version: params.block_version,
-                signature_id: params.signature_id
+                signature_id: self.config().global_id(),
             }
         )
             .set_smart_contract_info(smc_info)?
