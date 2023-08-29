@@ -154,7 +154,7 @@ impl AccStoragePrices {
         (fee + 0xffff) >> 16
     }
 
-    fn with_config(config: &ConfigParam18) -> Result<Self> {
+    pub fn with_config(config: &ConfigParam18) -> Result<Self> {
         let mut prices = vec![];
         for i in 0..config.len()? {
             prices.push(config.get(i as u32)?);
@@ -353,6 +353,10 @@ impl BlockchainConfig {
 
     pub fn global_version(&self) -> u32 {
         self.global_version
+    }
+
+    pub fn storage_prices(&self) -> &AccStoragePrices {
+        &self.storage_prices
     }
 
     pub fn raw_config(&self) -> &ConfigParams {
